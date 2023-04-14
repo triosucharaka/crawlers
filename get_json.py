@@ -1,5 +1,5 @@
 START_PAGE = 1
-END_PAGE = 10
+END_PAGE = 100
 OUTPUT_DIR = "shutter"
 
 import os
@@ -38,43 +38,47 @@ video_list = []
 json_list = sorted(os.listdir(json_dir))
 print(json_list)
 for json_file in json_list:
-    final_path = os.path.join(json_dir, json_file)
-    print(final_path)
-    json_file = json.loads(open(final_path, 'r').read())
-    for video_entry in json_file['pageProps']['videos']:
+    try:
+        final_path = os.path.join(json_dir, json_file)
+        print(final_path)
+        json_file = json.loads(open(final_path, 'r').read())
+        for video_entry in json_file['pageProps']['videos']:
 
-        ja = video_entry['contributor']['publicInformation']
-        if 'longbio' in ja:
-            biography = ja['longbio']
-        elif 'bio' in ja:
-            biography = ja['bio']
-        else:
-            biography = None
+            ja = video_entry['contributor']['publicInformation']
+            if 'longbio' in ja:
+                biography = ja['longbio']
+            elif 'bio' in ja:
+                biography = ja['bio']
+            else:
+                biography = None
 
-        if 'location' in ja:
-            location = ja['location']
-        else:
-            location = None
+            if 'location' in ja:
+                location = ja['location']
+            else:
+                location = None
 
-        entry_to_append = {
-            "id": video_entry['id'],
-            "description": video_entry['description'],
-            "duration": video_entry['duration'].replace('"',  ' ').replace("'", " "),
-            "aspectratio": video_entry['aspectRatioCommon'],
-            "videourl": video_entry['previewVideoUrls']['mp4'],
-            "author": {
-                "displayname": video_entry['contributor']['publicInformation']['displayName'],
-                "vanityname": video_entry['contributor']['publicInformation']['vanityUrlUsername'],
-                "location": location,
-                "bio": biography,
-                "equipment": video_entry['contributor']['publicInformation']['equipmentList'],
-                "styles": video_entry['contributor']['publicInformation']['styleList'],
-                "subject": video_entry['contributor']['publicInformation']['subjectMatterList'],
-            },
-            "categories": []
-        }
-        for category in video_entry['categories']:
-            entry_to_append['categories'].append(category['name'])
-        video_list.append(entry_to_append)
+            entry_to_append = {
+                "id": video_entry['id'],
+                "description": video_entry['description'],
+                "duration": video_entry['duration'].replace('"',  ' ').replace("'", " "),
+                "aspectratio": video_entry['aspectRatioCommon'],
+                "videourl": video_entry['previewVideoUrls']['mp4'],
+                "author": {
+                    "displayname": video_entry['contributor']['publicInformation']['displayName'],
+                    "vanityname": video_entry['contributor']['publicInformation']['vanityUrlUsername'],
+                    "location": location,
+                    "bio": biography,
+                    "equipment": video_entry['contributor']['publicInformation']['equipmentList'],
+                    "styles": video_entry['contributor']['publicInformation']['styleList'],
+                    "subject": video_entry['contributor']['publicInformation']['subjectMatterList'],
+                },
+                "categories": []
+            }
+            for category in video_entry['categories']:
+                entry_to_append['categories'].append(category['name'])
+            video_list.append(entry_to_append)
+    except Exception as e:
+        print(e)
+        pass
 
 json.dump(video_list, open("video_list.json", "w"))

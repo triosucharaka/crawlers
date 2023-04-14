@@ -3,7 +3,6 @@ import os
 import time
 import shutil
 import json
-from threading import Thread
 import httphandler
 from wrapt_timeout_decorator import *
 from diffusers import AutoencoderKL
@@ -18,7 +17,6 @@ import torch.multiprocessing as mp
 import tqdm
 from einops import rearrange
 import numpy as np
-import datasets
 from huggingface_hub import HfApi
 import tarfile
 mp.set_start_method('spawn', force=True)
@@ -33,8 +31,10 @@ DELAY = 5
 MAX_RETRIES = 2
 TIMEOUT_LEN = 30
 GPUS = BATCH_SIZE
-CHUNK_SIZE = 50 # 1GB in MB
+CHUNK_SIZE = 1024 # 1GB in MB
 HF_DATASET_PATH = "chavinlo/tempofunk"
+
+HF_DATASET_BRANCH = "testing-1"
 
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger()
@@ -68,6 +68,9 @@ def main():
 
     chunk_count = 0
     chunk_container = manager.list()
+
+    tar_map = {}
+    tar_map_bytes = BytesIO()
     
     while True:
         thread_list = [t for t in thread_list if t.is_alive()]
@@ -110,7 +113,21 @@ def main():
                 repo_id=HF_DATASET_PATH,
                 repo_type="dataset",
                 path_or_fileobj=tar_bytes,
-                path_in_repo=f"data/{str(chunk_count).zfill(5)}.tar"
+                path_in_repo=f"data/{str(chunk_count).zfill(5)}.tar",
+                revision=HF_DATASET_BRANCH,
+            )
+
+            tar_map[str(chunk_count).zfill(5)] = f"data/{str(chunk_count).zfill(5)}.tar"
+
+            with open(tar_map_bytes, 'w') as f:
+                json.dump(tar_map, f)
+
+            api.upload_file(
+                repo_id=HF_DATASET_PATH,
+                repo_type="dataset",
+                path_or_fileobj=tar_map_bytes,
+                path_in_repo=f"tar_map.json",
+                revision=HF_DATASET_BRANCH,
             )
 
             chunk_container[:] = []
