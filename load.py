@@ -1,73 +1,98 @@
 import datasets
-from io import BytesIO
-import numpy as np
+import json
+import torch
+import numpy
 
-_TAR_FILES=[
-    "data/00000.tar",
-    "data/00001.tar",
-    "data/00002.tar",
-    "data/00003.tar",
-    "data/00004.tar",
-    "data/00005.tar",
-    "data/00006.tar",
-    "data/00007.tar",
-    "data/00008.tar",
-    "data/00009.tar",
-    ]
-
-_TAR_FILES_DICT={
-    "00000": "data/00000.tar",
-    "00001": "data/00001.tar",
-    "00002": "data/00002.tar",
-    "00003": "data/00003.tar",
-    "00004": "data/00004.tar",
-    "00005": "data/00005.tar",
-    "00006": "data/00006.tar",
-    "00007": "data/00007.tar",
-    "00008": "data/00008.tar",
-    "00009": "data/00009.tar",
+_FEATURES = datasets.Features(
+    {
+        "id": datasets.Value("string"),
+        "prompt": datasets.Array3D(shape=(1, 77, 768), dtype="float32"),
+        "video": datasets.Sequence(feature=datasets.Array3D(shape=(4, 64, 64), dtype="float64")),
+        "description": datasets.Value("string"),
+        "videourl": datasets.Value("string"),
+        "categories": datasets.Value("string"),
+        "duration": datasets.Value("float"),
+        "full_metadata": datasets.Value("string"),
     }
+)
 
-class FunkLoader(datasets.GeneratorBasedBuilder):
+class FunkLoaderStream(datasets.GeneratorBasedBuilder):
     """TempoFunk Dataset"""
 
     def _info(self):
         return datasets.DatasetInfo(
             description="TempoFunk Dataset",
+            features=_FEATURES,
             homepage="None",
-            citation="Terry A. Davis",
-            license="PlusNi-"
+            citation="None",
+            license="None"
         )
 
     def _split_generators(self, dl_manager):
+
+        print("id_list available at:", dl_manager.download("data/id_list.json"))
+
+        _ID_LIST = json.loads(open(dl_manager.download("data/id_list.json"), 'r').read())
         
+        _SHARD_LENGTH = 20
+
+        _SPLITS = [_ID_LIST[i:i + _SHARD_LENGTH] for i in range(0, len(_ID_LIST), _SHARD_LENGTH)]
+
+        print("avail splits: ", _SPLITS)
+        
+
         l=[]
 
-        for k in _TAR_FILES_DICT.keys():
-            archive_path = dl_manager.download(_TAR_FILES_DICT[k])
+        _split_count = 0
+
+        for split in _SPLITS:
+
+            _list = []
+
+            for video_id in split:
+                _list.append({
+                    "frames": dl_manager.download(f"data/videos/{video_id}.pt"),
+                    "prompt": dl_manager.download(f"data/prompts/{video_id}.pt"),
+                    "metadata": dl_manager.download(f"data/metadata/{video_id}.json"),
+                })
+
             l.append(
                 datasets.SplitGenerator(
-                name=k,
-                gen_kwargs={
-                    "npy_files": dl_manager.iter_archive(archive_path),
-                },)
+                    name=f"split_{_split_count}",
+                    gen_kwargs={
+                        "chunk_container": _list,
+                    },)
             )
-            
+
+            _split_count = _split_count + 1
+
+        print("Total Splits: ", _split_count)
+        
         return l
-
-    def _generate_examples(self, npy_files):
+    
+    def _generate_examples(self, chunk_container):
         """Generate images and labels for splits."""
-        for file_path, file_obj in npy_files:
-            # NOTE: File object is (ALREADY) opened in binary mode.
-            numpy_bytes = file_obj.read()
-            numpy_dict = np.load(BytesIO(numpy_bytes), allow_pickle=True)
+        for video_entry in chunk_container:
+            frames_binary = video_entry['frames']
+            prompt_binary = video_entry['prompt']
+            metadata = json.loads(open(video_entry['metadata'], 'r').read())
 
-            reconverted_dict = {
-                "frames": numpy_dict.item().get("frames"),
-                "prompt": numpy_dict.item().get("prompt")
+            txt_embed = torch.load(open(prompt_binary, 'rb')).cpu().detach().numpy()
+            vid_embed = torch.load(open(frames_binary, 'rb'))
+
+            vid_embed_list = []
+
+            for frame in vid_embed:
+                _tmp = numpy.float32(frame['mean'].cpu().detach().numpy())
+                vid_embed_list.append(_tmp)
+
+            yield metadata['id'], {
+                "id": metadata['id'],
+                "prompt": txt_embed,
+                "video": vid_embed_list,
+                "description": metadata['description'],
+                "videourl": metadata['videourl'],
+                "categories": metadata['categories'],
+                "duration": metadata['duration'],
+                "full_metadata": metadata
             }
-
-            yield file_path, {
-                "tokenized_prompt": reconverted_dict['prompt'],
-                "video": reconverted_dict['frames']
-                }

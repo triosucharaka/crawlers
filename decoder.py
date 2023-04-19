@@ -7,8 +7,8 @@ import torch
 import einops
 
 MODEL_NAME = "runwayml/stable-diffusion-v1-5"
-PATH_TO_TENSOR = "video.pt"
-FRAME_COUNT = 55
+PATH_TO_TENSOR = "tmp_embed.pt"
+FRAME_COUNT = 95
 FPS_COUNT = 24
 
 vae = AutoencoderKL.from_pretrained(MODEL_NAME, subfolder='vae').to("cuda")
@@ -35,8 +35,10 @@ for frame_index in range(FRAME_COUNT):
     print(frame_index, "/", FRAME_COUNT)
 
 index = 0
-# for img in frame_list:
-#     index += 1
-#     img.save(f'/workspace/diffused-video-trainer/outimg/{index}_out.png')
+import os
+os.makedirs("outimg", exist_ok=True)
+for img in frame_list:
+    index += 1
+    img.save(f'outimg/{index}_out.png')
 
 imageio.mimsave('animation.gif', [np.array(img) for img in frame_list], 'GIF', fps=FPS_COUNT)

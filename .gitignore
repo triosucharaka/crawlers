@@ -4,6 +4,11 @@
 *.jpeg
 *.png
 *.json
+*.pt 
+*.npy
+
+im2im
+im2im-sswm
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
