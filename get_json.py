@@ -1,9 +1,10 @@
 START_PAGE = 1
-END_PAGE = 100
+END_PAGE = 5800
 OUTPUT_DIR = "shutter"
 
 import os
 import json
+import tqdm
 import requests
 
 headers = {
@@ -19,28 +20,32 @@ headers = {
     'Sec-Fetch-User': '?1',
 }
 
+# Start tqdm bar
+pbar = tqdm.tqdm(total=END_PAGE - START_PAGE)
+
 json_dir = os.path.join(OUTPUT_DIR, "json")
 if os.path.exists(json_dir) is False:
     os.makedirs(json_dir, exist_ok=True)
     current_page = START_PAGE
     while current_page < END_PAGE:
         target_url = f"https://www.shutterstock.com/_next/data/kw_ZhZGArSsA_d3Bew4Ok/es/_shutterstock/video/search/dance.json?page={current_page}&term=dance"
-        print("URL:", target_url)
+        #print("URL:", target_url)
         response = requests.get(target_url, headers=headers)
-        print(response.status_code)
+        #print(response.status_code)
         data = response.json()
         with open(os.path.join(json_dir, f'{current_page}.json'), 'w') as f:
             json.dump(data, f)
         current_page = current_page + 1
+        pbar.update(1)
 
 video_list = []
 
 json_list = sorted(os.listdir(json_dir))
-print(json_list)
+#print(json_list)
 for json_file in json_list:
     try:
         final_path = os.path.join(json_dir, json_file)
-        print(final_path)
+        #print(final_path)
         json_file = json.loads(open(final_path, 'r').read())
         for video_entry in json_file['pageProps']['videos']:
 

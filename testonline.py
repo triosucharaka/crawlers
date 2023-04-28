@@ -1,23 +1,29 @@
 from datasets import load_dataset
-import torch
+import numpy as np
 
-dataset = load_dataset("chavinlo/tempofunk", streaming=False, revision="testing-3")
+dataset = load_dataset("chavinlo/tempofunk-s", streaming=True)
 
 for split in dataset:
-    print(split)
+    #print(split)
     for e in dataset[split]:
-        entry = e['embeddings']
+        entry = e
         # list entry keys
-        print(entry.keys())
-        print(entry)
-        txt_embed = torch.load(open(entry['prompt'], 'rb')).cpu().detach().numpy()
-        print("Text:", txt_embed)
+        #print(entry.keys())
+        #print(entry)
+        print("desc: ", entry['description'])
+        print("url: ", entry['videourl'])
+        txt_embed = entry['prompt']
+        print(type(txt_embed))
+        txt_embed = np.array(txt_embed)
+        #print("Text:", txt_embed)
         print("Text:", txt_embed.shape)
         print("Text:", txt_embed.dtype)
-        vid_embed = torch.load(open(entry['frames'], 'rb'))
-        single_frame = vid_embed[0]['mean']
-        print("Video:", single_frame)
+        vid_embed = entry['video']
+        vid_embed = np.array(vid_embed)
+        #print(vid_embed)
+        single_frame = vid_embed[0]
+        #print("Video:", single_frame)
         print("Video:", single_frame.shape)
         print("Video:", single_frame.dtype)
-
-        exit()
+        print("#################")
+        #exit()

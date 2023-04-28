@@ -1,6 +1,5 @@
 import datasets
 import json
-import torch
 import numpy
 
 _FEATURES = datasets.Features(
@@ -51,8 +50,8 @@ class FunkLoaderStream(datasets.GeneratorBasedBuilder):
 
             for video_id in split:
                 _list.append({
-                    "frames": dl_manager.download(f"data/videos/{video_id}.pt"),
-                    "prompt": dl_manager.download(f"data/prompts/{video_id}.pt"),
+                    "frames": dl_manager.download(f"data/videos/{video_id}.npy"),
+                    "prompt": dl_manager.download(f"data/prompts/{video_id}.npy"),
                     "metadata": dl_manager.download(f"data/metadata/{video_id}.json"),
                 })
 
@@ -77,20 +76,16 @@ class FunkLoaderStream(datasets.GeneratorBasedBuilder):
             prompt_binary = video_entry['prompt']
             metadata = json.loads(open(video_entry['metadata'], 'r').read())
 
-            txt_embed = torch.load(open(prompt_binary, 'rb')).cpu().detach().numpy()
-            vid_embed = torch.load(open(frames_binary, 'rb'))
+            txt_embed = numpy.load(prompt_binary)
+            vid_embed = numpy.load(frames_binary)
 
-            vid_embed_list = []
-
-            for frame in vid_embed:
-                _tmp = numpy.float32(frame['mean'].cpu().detach().numpy())
-                vid_embed_list.append(_tmp)
+            print(vid_embed.shape)
 
             yield metadata['id'], {
                 "id": metadata['id'],
-                "prompt": txt_embed,
-                "video": vid_embed_list,
                 "description": metadata['description'],
+                "prompt": txt_embed,
+                "video": vid_embed,
                 "videourl": metadata['videourl'],
                 "categories": metadata['categories'],
                 "duration": metadata['duration'],

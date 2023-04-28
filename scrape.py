@@ -31,8 +31,8 @@ class ImpQueue(torch.multiprocessing.queue.Queue):
 mp.set_start_method('spawn', force=True)
 mp.freeze_support()
 
-GPUS = 3
-BATCH_SIZE = 10
+GPUS = 1
+BATCH_SIZE = 10 # <- Download batch size (as in threads)
 UPLOAD_BATCH_SIZE = 10
 
 OUTPUT_DIR = "shutter"
@@ -43,20 +43,23 @@ DELAY = 5
 MAX_RETRIES = 3
 TIMEOUT_LEN = 30
 
-HF_DATASET_PATH = "chavinlo/tempofunk"
-HF_DATASET_BRANCH = "testing-5"
-MAX_FRAMES = 240
+HF_DATASET_PATH = "chavinlo/tempofunk-s"
+HF_DATASET_BRANCH = "main"
+MAX_FRAMES = 120
 
-MAX_IN_PROCESS_VIDEOS = 100
-MAX_IN_UPLOAD_VIDEOS = 100
+MAX_IN_PROCESS_VIDEOS = 30
+MAX_IN_UPLOAD_VIDEOS = 30
 
 RESIZE_VIDEO = True
 REMOVE_WATERMARK = True
 
+#Resuming
+RESUME = True
+PATH_TO_SKIP_IDS = "skip_ids.json"
+PATH_TO_PREV_FAILED_IDS = "prev_failed_ids.json"
+
 #Debugging
 TESTING_MODE = False # DISABLE THIS
-
-ENABLE_DEBUG = True
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(f"{OUTPUT_DIR}/error", exist_ok=True)
@@ -68,7 +71,6 @@ logger.addHandler(logging.FileHandler('logfile.log', 'a'))
 model_list = []
 
 dlib = httphandler.HTTPHandler()
-video_list = json.load(open(JSON_PATH, "r"))
 tokenizer = CLIPTokenizer.from_pretrained(MODEL, subfolder="tokenizer")
 
 init_time = time.time()
@@ -310,6 +312,11 @@ def processing_thread(proc_queue: ImpQueue, uplo_queue: ImpQueue, gpu_id: int, i
             continue
 
 def main():
+
+    video_list = json.load(open(JSON_PATH, "r"))
+    skip_ids = json.load(open(PATH_TO_SKIP_IDS, "r"))
+    prev_failed_ids = json.load(open(PATH_TO_PREV_FAILED_IDS, "r")) 
+
     api = HfApi()
     manager = mp.Manager()
 
@@ -318,6 +325,18 @@ def main():
 
     id_list = manager.list()
     failed_id_list = manager.list()
+
+    # Remove skip_ids from the video_list
+    if RESUME is True:
+        video_list = [x for x in video_list if x['id'] not in skip_ids]
+
+        for i in skip_ids:
+            id_list.append(i)
+
+        for i in prev_failed_ids:
+            failed_id_list.append(i)
+
+    print("Total videos to process:", len(video_list))
 
     for gpu_id in range(0, GPUS):
         mp.Process(target=processing_thread, args=(proc_queue, uplo_queue, gpu_id, id_list, failed_id_list,)).start()
@@ -381,7 +400,7 @@ def scrape_post(videometa, proc_queue: ImpQueue):
     try:
         id = videometa['id']
         stream, ext = get_post_wrapper(videometa)
-        _output_path = "/tmp/" + id + "." + ext
+        _output_path = "/tmp/" + id + ext
         shutil.copyfileobj(stream, open(_output_path, 'wb'))
         proc_queue.put({
             "metadata": videometa,
