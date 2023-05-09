@@ -6,6 +6,7 @@
 *.json
 *.pt 
 *.npy
+*.db
 
 im2im
 im2im-sswm

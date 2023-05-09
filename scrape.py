@@ -21,6 +21,7 @@ import tqdm
 import cv2
 import math
 import numpy as np
+import sqlite3
 
 #I don't remember what I was gonna use this for lol
 class ImpQueue(torch.multiprocessing.queue.Queue):
@@ -31,20 +32,22 @@ class ImpQueue(torch.multiprocessing.queue.Queue):
 mp.set_start_method('spawn', force=True)
 mp.freeze_support()
 
-GPUS = 1
+GPUS = 2
 BATCH_SIZE = 10 # <- Download batch size (as in threads)
 UPLOAD_BATCH_SIZE = 10
 
 OUTPUT_DIR = "shutter"
-JSON_PATH = "video_list.json"
+DB_PATH = "/home/dep/tempofunk-scrapper/mapper/video_list.db"
+
 MODEL = "runwayml/stable-diffusion-v1-5"
 
 DELAY = 5
 MAX_RETRIES = 3
 TIMEOUT_LEN = 30
 
-HF_DATASET_PATH = "chavinlo/tempofunk-s"
+HF_DATASET_PATH = "TempoFunk/small"
 HF_DATASET_BRANCH = "main"
+HF_TOKEN = "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"
 MAX_FRAMES = 120
 
 MAX_IN_PROCESS_VIDEOS = 30
@@ -55,8 +58,6 @@ REMOVE_WATERMARK = True
 
 #Resuming
 RESUME = True
-PATH_TO_SKIP_IDS = "skip_ids.json"
-PATH_TO_PREV_FAILED_IDS = "prev_failed_ids.json"
 
 #Debugging
 TESTING_MODE = False # DISABLE THIS
@@ -88,12 +89,12 @@ def load_model(path: str, device: str | torch.device = 'cuda') -> UNet:
     model = UNet(**config['config'])
     model.load_state_dict(torch.load(os.path.join(path, config['ckpt'])))
     model = model.eval().requires_grad_(False).to(device = device, memory_format = torch.contiguous_format)
-    model = torch.compile(model, mode = 'max-autotune', fullgraph = True)
+    #model = torch.compile(model, mode = 'max-autotune', fullgraph = True)
     return model
 
 def upload_thread(uplo_queue: ImpQueue, id_list, failed_id):
 
-    api = HfApi()
+    api = HfApi(token=HF_TOKEN)
     processing_chunk = []
 
     while True:
@@ -178,7 +179,7 @@ def processing_thread(proc_queue: ImpQueue, uplo_queue: ImpQueue, gpu_id: int, i
 
     vae: AutoencoderKL = AutoencoderKL.from_pretrained(MODEL, subfolder='vae').to(f'cuda:{gpu_id}')
     text_encoder: CLIPTextModel = CLIPTextModel.from_pretrained(MODEL, subfolder='text_encoder').to(f'cuda:{gpu_id}')
-    watermark_remover = load_model("/home/redmond/tempofunk-scrapper/im2im-sswm", device=f'cuda:{gpu_id}')
+    watermark_remover = load_model("/home/dep/im2im-sswm", device=f'cuda:{gpu_id}')
 
     print("Finished loading models on GPU ", gpu_id)
 
@@ -202,24 +203,14 @@ def processing_thread(proc_queue: ImpQueue, uplo_queue: ImpQueue, gpu_id: int, i
         print("Processing video", metadata['id'], "with prompt", prompt)
 
         try:
-
             cap = cv2.VideoCapture(video)
             _tqdm_bar = tqdm.tqdm(total=MAX_FRAMES, position=gpu_id, leave=False)
-
             video_vae_frames.clear()
-            
-            # _vid_id = metadata['id']
-            # _tmp_dir = f"{OUTPUT_DIR}/{_vid_id}"
-            # os.makedirs(_tmp_dir, exist_ok=True)
 
             for i in range(MAX_FRAMES):
                 success, image = cap.read()
                 image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                # image is a numpy array
                 im_pil = Image.fromarray(image, mode='RGB')
-                #im_pil.save(f"{_tmp_dir}/{i}_before.png")
-
-                #_conv_im = torch.tensor(np.asarray(im_pil)).permute(0,3,1,2)
                 if REMOVE_WATERMARK is True:
 
                     # Stack it so that the dewatermarker can process it (im too lazy to change the code lol)
@@ -232,20 +223,16 @@ def processing_thread(proc_queue: ImpQueue, uplo_queue: ImpQueue, gpu_id: int, i
                     right = math.ceil(w / watermark_remover.ksize) * watermark_remover.ksize - w
                     bottom = math.ceil(h / watermark_remover.ksize) * watermark_remover.ksize - h
                     x = torch.nn.functional.pad(_conv_im, [0, right, 0, bottom], mode = 'reflect')
-                    # print("x.shape", x.shape)
-                    # print("x.device", x.device)
                     
                     with torch.autocast(torch.device(f'cuda:{gpu_id}').type):
                         y = watermark_remover(x)
                     y = y[:,:,0:h,0:w]
                     y = y.mul(255).round().clamp(0,255).permute(0,2,3,1).to(device = 'cpu', dtype = torch.uint8).numpy()
                     im_pil = Image.fromarray(y[0])
-                    #im_pil.save(f"{_tmp_dir}/{i}_after.png")
                     # Dewatermarker end
 
                 if RESIZE_VIDEO is True:
                     im_pil = ImageOps.fit(im_pil, (512, 512), centering = (0.5, 0.5))
-                #im_pil.save(f"{_tmp_dir}/{i}_resize.png")
                 with torch.inference_mode():
                     m = pil_to_torch(im_pil, f'cuda:{gpu_id}').unsqueeze(0)
                     m = vae.encode(m).latent_dist
@@ -255,7 +242,6 @@ def processing_thread(proc_queue: ImpQueue, uplo_queue: ImpQueue, gpu_id: int, i
             print("Video", metadata['id'], "processed.")
 
             cap.release()
-            os.remove(video)
             _tqdm_bar.close()
 
             # Encode prompt
@@ -267,8 +253,6 @@ def processing_thread(proc_queue: ImpQueue, uplo_queue: ImpQueue, gpu_id: int, i
                     padding="max_length",
                 ).input_ids.to(f'cuda:{gpu_id}')
             encoded_prompt = text_encoder(input_ids=tokenized_prompt)
-            #print("La cosa:", encoded_prompt)
-            #encoded_prompt = encoded_prompt.to(f'cuda:{gpu_id}').last_hidden_state
 
             if TESTING_MODE is True:
                 _tmp_embed = torch.stack(video_vae_frames)
@@ -287,9 +271,6 @@ def processing_thread(proc_queue: ImpQueue, uplo_queue: ImpQueue, gpu_id: int, i
             np.save(video_bytes, np_video_vae_frames)
             np.save(prompt_bytes, np_encoded_prompt)
 
-            # torch.save(video_vae_frames, video_bytes)
-            # torch.save(encoded_prompt, prompt_bytes)
-
             video_bytes.seek(0)
             prompt_bytes.seek(0)
 
@@ -301,23 +282,23 @@ def processing_thread(proc_queue: ImpQueue, uplo_queue: ImpQueue, gpu_id: int, i
             })
             id_list.append(metadata['id'])
         except Exception as e:
-            print("ERROR - Video ", metadata['id'], "with prompt", prompt, ":", e)
+            #print cap video dimensions
+
+            print("ERROR - Video ", metadata['id'], "|", "Error: ", e)
             failed_id_list.append(metadata['id'])
             cap.release()
-            # filename, ext = os.path.splitext(video)
-            # shutil.copyfile(video, f"{OUTPUT_DIR}/error/{metadata['id']}.{ext}")
-            # os.remove(video)
-            # print("Saved faulty video to: ", f"{OUTPUT_DIR}/error/{metadata['id']}.{ext}")
             _tqdm_bar.close()
             continue
+        if os.path.exists(video):
+           os.remove(video)
 
 def main():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
 
-    video_list = json.load(open(JSON_PATH, "r"))
-    skip_ids = json.load(open(PATH_TO_SKIP_IDS, "r"))
-    prev_failed_ids = json.load(open(PATH_TO_PREV_FAILED_IDS, "r")) 
+    print("Using token: ", HF_TOKEN)
 
-    api = HfApi()
+    api = HfApi(token=HF_TOKEN)
     manager = mp.Manager()
 
     proc_queue = ImpQueue(ctx=mp.get_context('spawn'))
@@ -326,29 +307,34 @@ def main():
     id_list = manager.list()
     failed_id_list = manager.list()
 
-    # Remove skip_ids from the video_list
-    if RESUME is True:
-        video_list = [x for x in video_list if x['id'] not in skip_ids]
+    c.execute("SELECT COUNT(*) FROM videos")
+    total_rows = c.fetchone()[0]
 
-        for i in skip_ids:
-            id_list.append(i)
-
-        for i in prev_failed_ids:
-            failed_id_list.append(i)
-
-    print("Total videos to process:", len(video_list))
+    print("Total videos to process:", total_rows)
 
     for gpu_id in range(0, GPUS):
         mp.Process(target=processing_thread, args=(proc_queue, uplo_queue, gpu_id, id_list, failed_id_list,)).start()
-
-    time.sleep(10)
 
     mp.Process(target=upload_thread, args=(uplo_queue, id_list, failed_id_list,)).start()
 
     api.create_branch(repo_id=HF_DATASET_PATH, branch=HF_DATASET_BRANCH, exist_ok=True, repo_type="dataset")
     
     thread_list = []
-    list_index = 0
+    list_index = 1000
+
+    def get_db_row(index):
+        c.execute("SELECT * FROM videos LIMIT 1 OFFSET ?", (index,))
+        row = c.fetchone()
+        video_dict = {
+            "id": row[0],
+            "description": row[1],
+            "duration": row[2],
+            "aspectratio": row[3],
+            "videourl": row[4],
+            "author": json.loads(row[5]),
+            "categories": json.loads(row[6])
+        }
+        return video_dict
     
     while True:
         #display in HH:MM:SS
@@ -363,7 +349,10 @@ def main():
             thread_list = [t for t in thread_list if t.is_alive()]
             cur_batch = BATCH_SIZE - len(thread_list)
             for i in range(0, cur_batch):
-                thread_list.append(mp.Process(target=scrape_post_timeout, args=(video_list[list_index + i], proc_queue,)))
+                thread_list.append(mp.Process(target=scrape_post_timeout, args=(
+                    get_db_row(list_index + i), 
+                    proc_queue,)
+                ))
             for thread in thread_list:
                 if not thread.is_alive():
                     try:
