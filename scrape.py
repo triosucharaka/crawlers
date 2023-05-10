@@ -22,6 +22,8 @@ import cv2
 import math
 import numpy as np
 import sqlite3
+import tarfile
+import requests
 
 #I don't remember what I was gonna use this for lol
 class ImpQueue(torch.multiprocessing.queue.Queue):
@@ -32,12 +34,12 @@ class ImpQueue(torch.multiprocessing.queue.Queue):
 mp.set_start_method('spawn', force=True)
 mp.freeze_support()
 
-GPUS = 2
+GPUS = 1
 BATCH_SIZE = 10 # <- Download batch size (as in threads)
-UPLOAD_BATCH_SIZE = 10
+UPLOAD_BATCH_SIZE = 30
 
 OUTPUT_DIR = "shutter"
-DB_PATH = "/home/dep/tempofunk-scrapper/mapper/video_list.db"
+DB_PATH = "map.db"
 
 MODEL = "runwayml/stable-diffusion-v1-5"
 
@@ -45,19 +47,20 @@ DELAY = 5
 MAX_RETRIES = 3
 TIMEOUT_LEN = 30
 
-HF_DATASET_PATH = "TempoFunk/small"
+HF_DATASET_PATH = "TempoFunk/medium"
 HF_DATASET_BRANCH = "main"
-HF_TOKEN = "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"
-MAX_FRAMES = 120
+HF_TOKEN = "yes i know that in the previous commit I placed my token here, but I deleted it now hahaha!!! :snailchan_pointandlaugh:"
+MAX_FRAMES = 48
 
-MAX_IN_PROCESS_VIDEOS = 30
-MAX_IN_UPLOAD_VIDEOS = 30
+INIT_INDEX = 1000
+
+DISCORD_WEBHOOK = ""
+
+MAX_IN_PROCESS_VIDEOS = 60
+MAX_IN_UPLOAD_VIDEOS = 60
 
 RESIZE_VIDEO = True
 REMOVE_WATERMARK = True
-
-#Resuming
-RESUME = True
 
 #Debugging
 TESTING_MODE = False # DISABLE THIS
@@ -97,6 +100,10 @@ def upload_thread(uplo_queue: ImpQueue, id_list, failed_id):
     api = HfApi(token=HF_TOKEN)
     processing_chunk = []
 
+    chunk_count = 0
+    _chunk_list = []
+    _detailed_chunk_list = {}
+
     while True:
         if uplo_queue.qsize() >= UPLOAD_BATCH_SIZE:
             try:
@@ -105,6 +112,9 @@ def upload_thread(uplo_queue: ImpQueue, id_list, failed_id):
                     processing_chunk.append(uplo_queue.get())
 
                 print("Uploading batch of videos...")
+
+                tar_bytes = BytesIO()
+                tar = tarfile.open(fileobj=tar_bytes, mode='w')
                 
                 for batch in processing_chunk:
                     batch: dict
@@ -113,25 +123,33 @@ def upload_thread(uplo_queue: ImpQueue, id_list, failed_id):
                     #batch is a video contents. aka metadata, video, prompt
 
                     for key, value in batch.items():
+                        # value is the npy obj in the case of videos and prompt, for metadata its a dict
                         if key == 'metadata':
-                            path_to_upload = f"data/metadata/{batch_id}.json"
+                            _filename = f"jso_{batch_id}.json"
                             obj_to_upload = BytesIO(json.dumps(value).encode())
                         elif key == 'video':
-                            path_to_upload = f"data/videos/{batch_id}.npy"
+                            _filename = f"vid_{batch_id}.npy"
                             obj_to_upload = value
                         elif key == 'prompt':
-                            path_to_upload = f"data/prompts/{batch_id}.npy"
+                            _filename = f"txt_{batch_id}.npy"
                             obj_to_upload = value
 
-                        api.upload_file(
-                            repo_id=HF_DATASET_PATH,
-                            repo_type="dataset",
-                            path_or_fileobj=obj_to_upload,
-                            path_in_repo=path_to_upload,
-                            revision=HF_DATASET_BRANCH,
-                        )
+                        tarinfo = tarfile.TarInfo(name=_filename)
+                        tarinfo.size = len(obj_to_upload.getvalue())
+                        tar.addfile(tarinfo, obj_to_upload)
 
-                        print(f"Uploaded {key} for video {batch_id}")
+                tar.close()
+                tar_bytes.seek(0)
+
+                api.upload_file(
+                    repo_id=HF_DATASET_PATH,
+                    repo_type="dataset",
+                    path_or_fileobj=tar_bytes,
+                    path_in_repo=f"data/{str(chunk_count).zfill(5)}.tar",
+                    revision=HF_DATASET_BRANCH,
+                )
+
+                print(f"Uploaded {key} for video {batch_id}")
 
                 _tmp_list = []
 
@@ -143,6 +161,10 @@ def upload_thread(uplo_queue: ImpQueue, id_list, failed_id):
                 for i in failed_id:
                     _failed_list.append(i)
 
+                _chunk_list.append(str(chunk_count).zfill(5))
+
+                _detailed_chunk_list[str(chunk_count).zfill(5)] = _tmp_list
+
                 json_bytes = BytesIO(json.dumps(_tmp_list).encode())
                 failed_json_bytes = BytesIO(json.dumps(_failed_list).encode())
 
@@ -150,7 +172,7 @@ def upload_thread(uplo_queue: ImpQueue, id_list, failed_id):
                     repo_id=HF_DATASET_PATH,
                     repo_type="dataset",
                     path_or_fileobj=json_bytes,
-                    path_in_repo="data/id_list.json",
+                    path_in_repo="lists/id_list.json",
                     revision=HF_DATASET_BRANCH,
                 )
 
@@ -158,9 +180,45 @@ def upload_thread(uplo_queue: ImpQueue, id_list, failed_id):
                     repo_id=HF_DATASET_PATH,
                     repo_type="dataset",
                     path_or_fileobj=failed_json_bytes,
-                    path_in_repo="data/failed_id_list.json",
+                    path_in_repo="lists/failed_id_list.json",
                     revision=HF_DATASET_BRANCH,
                 )
+
+                api.upload_file(
+                    repo_id=HF_DATASET_PATH,
+                    repo_type="dataset",
+                    path_or_fileobj=BytesIO(json.dumps(_chunk_list).encode()),
+                    path_in_repo="lists/chunk_list.json",
+                    revision=HF_DATASET_BRANCH,
+                )
+
+                api.upload_file(
+                    repo_id=HF_DATASET_PATH,
+                    repo_type="dataset",
+                    path_or_fileobj=BytesIO(json.dumps(_detailed_chunk_list).encode()),
+                    path_in_repo="lists/detailed_chunk_list.json",
+                    revision=HF_DATASET_BRANCH,
+                )
+
+                chunk_count += 1
+
+                webhook_data = {
+                    "content": None,
+                    "embeds": [
+                        {
+                        "title": f"Chunk {chunk_count} uploaded",
+                        "description": f"uploaded so far: {id_list.__len__()}\nelapsed time: {time.strftime('%H:%M:%S', time.gmtime(time.time() - init_time))}",
+                        "color": 16027384
+                        }
+                    ],
+                    "username": "data-chan (scrape)",
+                    "attachments": []
+                }
+
+                try: 
+                    requests.post(DISCORD_WEBHOOK, json=webhook_data)
+                except:
+                    print("Error sending discord webhook")
 
                 print("Uploaded id list")
             except Exception as e:
@@ -179,7 +237,7 @@ def processing_thread(proc_queue: ImpQueue, uplo_queue: ImpQueue, gpu_id: int, i
 
     vae: AutoencoderKL = AutoencoderKL.from_pretrained(MODEL, subfolder='vae').to(f'cuda:{gpu_id}')
     text_encoder: CLIPTextModel = CLIPTextModel.from_pretrained(MODEL, subfolder='text_encoder').to(f'cuda:{gpu_id}')
-    watermark_remover = load_model("/home/dep/im2im-sswm", device=f'cuda:{gpu_id}')
+    watermark_remover = load_model("/root/tempofunk-scrapper/im2im-sswm", device=f'cuda:{gpu_id}')
 
     print("Finished loading models on GPU ", gpu_id)
 
@@ -320,7 +378,7 @@ def main():
     api.create_branch(repo_id=HF_DATASET_PATH, branch=HF_DATASET_BRANCH, exist_ok=True, repo_type="dataset")
     
     thread_list = []
-    list_index = 1000
+    list_index = INIT_INDEX
 
     def get_db_row(index):
         c.execute("SELECT * FROM videos LIMIT 1 OFFSET ?", (index,))
@@ -338,7 +396,7 @@ def main():
     
     while True:
         #display in HH:MM:SS
-        print("Total videos scraped:", list_index, "in", time.strftime('%H:%M:%S', time.gmtime(time.time() - init_time)))
+        print("Total videos scraped:", id_list.__len__(), "in", time.strftime('%H:%M:%S', time.gmtime(time.time() - init_time)))
         print("Total Failed:", len(failed_id_list))
         print("Queue Slots:", proc_queue.qsize(), "/", MAX_IN_PROCESS_VIDEOS)
         if proc_queue.qsize() >= MAX_IN_PROCESS_VIDEOS:
@@ -362,10 +420,6 @@ def main():
                         print(e)
             list_index += cur_batch
             time.sleep(DELAY)
-
-            #print thread status
-            for thread in thread_list:
-                print(thread.is_alive())
 
 def pil_to_torch(image, device = 'cpu'):
     return (2 * (pil_to_tensor(image).to(dtype=torch.float32, device=device)) / 255) - 1
