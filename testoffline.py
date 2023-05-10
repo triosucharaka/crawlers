@@ -1,7 +1,7 @@
 from datasets import load_dataset
 import torch
 
-dataset = load_dataset("chavinlo/tempofunk", streaming=False, revision="testing-3")
+dataset = load_dataset("chavinlo/test1", streaming=False, revision="testing-3")
 
 for split in dataset:
     print(split)

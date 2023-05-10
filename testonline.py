@@ -1,7 +1,7 @@
 from datasets import load_dataset
 import numpy as np
 
-dataset = load_dataset("chavinlo/tempofunk-s", streaming=True)
+dataset = load_dataset("chavinlo/test1", streaming=True)
 
 for split in dataset:
     #print(split)
@@ -25,5 +25,7 @@ for split in dataset:
         #print("Video:", single_frame)
         print("Video:", single_frame.shape)
         print("Video:", single_frame.dtype)
+        print(txt_embed)
         print("#################")
+        print("Sucess!")
         #exit()
