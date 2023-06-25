@@ -31,9 +31,14 @@ def sql_thread(_queue: queue.Queue, configuration: dict):
              framerate TEXT,
              r18 TEXT)''')
     
+    _cc = 0
+
     while True:
         time.sleep(0.5)
-        print(f'SQL: queue size: {_queue.qsize()}')
+        _cc = _cc + 1
+        if _cc >= 10:
+            print(f'SQL: {_queue.qsize()} / {save_batch_size}')
+            _cc = 0
         if _queue.qsize() > save_batch_size:
             print(f'SQL: saving...')
             for i in range(save_batch_size):
