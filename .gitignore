@@ -11,6 +11,9 @@
 im2im
 im2im-sswm
 
+output
+webdataset
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
