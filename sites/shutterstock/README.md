@@ -1,4 +1,6 @@
-# Proxies
+# ShutterStock
+
+## Proxies
 
 proxies.json
 
@@ -10,7 +12,9 @@ proxies.json
 }
 ```
 
-# Stage 1
+## Stage 1: Mapping
+
+In this stage we map shutterstock whole list of URL:CAPTION:FPS:Etc
 
 ```
 python3 main.py --config /home/ubuntu/tempofunk-scrapper/config/shutterstock/stage_1.json --proxyconf /home/ubuntu/tempofunk-scrapper/config/proxies.json
@@ -31,3 +35,10 @@ stage_1.json
 }
 ```
 
+## Stage 2: Processing/Encoding
+
+In this stage we:
+- Download the videos
+- Dewatermark the videos
+- Encode into latents and embedding
+- Upload (dewatermarked video), (frame latents), (text embedding)
