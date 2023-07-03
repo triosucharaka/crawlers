@@ -108,7 +108,7 @@ def packaging_thread(input_queue: mp.Queue, scrap_config):
     while True:
         _cc = _cc + 1
         if _cc >= 10:
-            print("PKG:" + str(int(tar_bytes.getbuffer().nbytes / 1024 / 1024)) + "/" + str(int(save_bytes_size / 1024 / 1024)))
+            print("Packager: " + str(int(tar_bytes.getbuffer().nbytes / 1024 / 1024)) + "/" + str(int(save_bytes_size / 1024 / 1024)) + "MB")
             _cc = 0
 
         # wait for input
@@ -157,7 +157,7 @@ def packaging_thread(input_queue: mp.Queue, scrap_config):
                 commit_message=f"Chunklist update"
             )
 
-            print(f"Uploaded chunk {chunk_id}")
+            print(f"HuggingFace: Uploaded chunk {chunk_id}")
             chunk_id = chunk_id + 1
         time.sleep(0.1)
 
@@ -286,7 +286,7 @@ def main():
 
         if _packaging_queue.qsize() > max_packaging_size:
             while not (_packaging_queue.qsize() < max_packaging_size):
-                print("Packaging Queue full, waiting for it to be lower than " + str(max_packaging_size) + "...")
+                print("Downloader: Packaging Queue full, waiting for it to be lower than " + str(max_packaging_size) + "...")
                 time.sleep(1)
 
         # grab {cur_batch} items from _data_queue
