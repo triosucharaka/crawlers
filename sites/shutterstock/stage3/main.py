@@ -260,6 +260,26 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
                 }
             )
 
+            wandb_pipe.put(
+                {
+                    'at': 'sum', 
+                    'c': {
+                        'name': 'aw/frames',
+                        'value': frame_count
+                    }
+                }
+            )
+
+            wandb_pipe.put(
+                {
+                    'at': 'sum', 
+                    'c': {
+                        'name': 'aw/hours',
+                        'value': frame_count / v_metadata['video_fps'] / 60 / 60
+                    }
+                }
+            )
+
 def wandb_worker(wandb_pipe: mp.Queue):
     wandb_run = wandb.init(
         project=WANDB_PROJ, 
