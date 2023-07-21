@@ -19,7 +19,6 @@ SAVE_PATH = "/home/windowsuser/test"
 FILE_PIPE_MAX = 20
 IN_DATA_PIPE_MAX = 250
 OUT_DATA_PIPE_MAX = 250
-
 ASSIGN_WORKERS = 4
 
 ## TPU Workers
