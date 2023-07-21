@@ -16,9 +16,11 @@ import torchvision.transforms.functional as F
 ## General
 DISK_PATH = "/mnt/disks/hhd/tango/videos"
 SAVE_PATH = "/home/windowsuser/test"
-FILE_PIPE_MAX = 10
+FILE_PIPE_MAX = 20
 IN_DATA_PIPE_MAX = 250
 OUT_DATA_PIPE_MAX = 250
+
+ASSIGN_WORKERS = 4
 
 ## TPU Workers
 TPU_CORE_COUNT = 8
@@ -75,19 +77,6 @@ def tpu_worker(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue):
         batch = batch[:,:,0:_h,0:_w]
         batch = batch.mul(255).round().clamp(0,255).permute(0,2,3,1).to(device = 'cpu', dtype = torch.uint8).numpy() # (B, C, H, W) -> (B, H, W, C) # batch is now a numpy array, uint8, 0-255
         return batch
-
-    # compile_tensor = torch.rand(TPU_BATCH_SIZE, C_H, C_W, C_C)
-    # compile_tensor = (compile_tensor * 255).type(torch.uint8)
-    # print(f'tw-{index}: before prep_batch, shape {compile_tensor.shape}, dtype {compile_tensor.dtype}, device {compile_tensor.device}, range {compile_tensor.min()} - {compile_tensor.max()}')
-    # compile_tensor, _, _ = prep_batch(compile_tensor)
-
-    # print(f'tw-{index}: compiling model for shape {compile_tensor.shape}, dtype {compile_tensor.dtype}, device {compile_tensor.device}, range {compile_tensor.min()} - {compile_tensor.max()}')
-    # init_time = time.time()
-    # out = model(compile_tensor)
-    # out.cpu() # force sync
-    # end_time = time.time()
-    # comp_time = time.strftime('%H:%M:%S', time.gmtime(end_time - init_time))
-    # print(f'tw-{index}: compilation time: {comp_time} with shape {out.shape}')
 
     print(f'tw-{index}: init signal received')
     first_run = True # first run is always compilation 
@@ -184,8 +173,6 @@ def assign_worker(file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_data_pipe: mp
             # add batch at the correct index
             output_superbatch.append({"o": batch_id, "v": batch['value']})
             print(f"aw: {video_path} - batch {batch_id} received")
-        # # remove None values
-        # output_superbatch = [x for x in output_superbatch if x is not None]
         # order
         output_superbatch.sort(key=lambda x: x['o'])
         output_superbatch = [x['v'] for x in output_superbatch]
@@ -205,9 +192,13 @@ def main():
     in_data_pipe = manager.Queue(IN_DATA_PIPE_MAX)
     out_data_pipe = manager.Queue(OUT_DATA_PIPE_MAX)
     print("Objects created")
-    assign_worker_process = mp.Process(target=assign_worker, args=(file_pipe, in_data_pipe, out_data_pipe,))
-    assign_worker_process.start()
-    print("Assign worker started")
+    assign_workers = list()
+    for i in range(ASSIGN_WORKERS):
+        assign_worker_process = mp.Process(target=assign_worker, args=(file_pipe, in_data_pipe, out_data_pipe, i,))
+        assign_worker_process.start()
+        assign_workers.append(assign_worker_process)
+        print(f"Assign worker {i} started")
+    print("Assign workers started")
     disk_reader_worker = mp.Process(target=disk_reader, args=(file_pipe,))
     disk_reader_worker.start()
     print("Disk reader started")
@@ -216,8 +207,11 @@ def main():
     #     tpu_worker_process.start()
     print("starting TPU workers (forced join, idk why???)")
     xmp_obj = xmp.spawn(tpu_worker, args=(in_data_pipe, out_data_pipe,), nprocs=TPU_CORE_COUNT)
-    assign_worker_process.join()
+    print("TPU workers started")
+    for worker in assign_workers:
+        worker.join()
     disk_reader_worker.join()
+    print("All workers joined, exiting")
 
 if __name__ == "__main__":
     main()
