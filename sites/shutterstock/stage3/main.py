@@ -10,6 +10,13 @@ from im2im.main import load_model
 import numpy as np
 import torchvision
 import torchvision.transforms.functional as F
+import wandb
+import copy
+
+"""
+v1 - wonderhoy
+"""
+CODENAME = "wonderhoy"
 
 # config
 
@@ -21,6 +28,15 @@ IN_DATA_PIPE_MAX = 250
 OUT_DATA_PIPE_MAX = 250
 ASSIGN_WORKERS = 4
 
+## Wandb
+
+global USE_WANDB
+
+USE_WANDB = True
+WANDB_ENTITY = "tempofunk" # none if not using wandb
+WANDB_PROJ = "shutterstock_stage3"
+WANDB_ONLY_ONE_CORE = True
+
 ## TPU Workers
 TPU_CORE_COUNT = 8
 TPU_BATCH_SIZE = 16
@@ -31,7 +47,7 @@ C_H = 384 # (divisible by 64)
 C_W = 640 # (divisible by 64)
 
 ## Debug
-DEBUG = True
+DEBUG = False
 DR_DELAY = 0.1
 
 def disk_reader(file_pipe: mp.Queue):
@@ -54,12 +70,48 @@ def disk_reader(file_pipe: mp.Queue):
     for i in range(TPU_CORE_COUNT):
         file_pipe.put((None, None))
 
-def tpu_worker(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue):
+class wandb_logger:
+    def __init__(self, wandb_pipe: mp.Queue, index: int, prefix: str = None):
+        self.wandb_pipe = wandb_pipe
+        self.index = index
+        self.prefix = prefix
+
+    def dlog(self, name, data):
+        self.wandb_pipe.put(
+            {
+                'at': 'direct', 
+                'c': {
+                    f"{self.prefix}_{self.index}/{name}": data
+                }
+            }
+        )
+
+    def g_dlog(self, data, name):
+        self.wandb_pipe.put(
+            {
+                'at': 'direct', 
+                'c': {
+                    f"{self.prefix}_g/{name}": data
+                }
+            }
+        )
+
+def tpu_worker(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, wandb_pipe: mp.Queue = None):
     print(f'tw-{index}: started, grabbing device {index}')
     device = xm.xla_device()
     print(f'tw-{index}: device {index} successfully grabbed')
     model = load_model(IM2IM_MODEL_PATH, device)
     print(f'tw-{index}: model loaded')
+
+    global USE_WANDB
+    use_wandb = copy.copy(USE_WANDB)
+
+    if WANDB_ONLY_ONE_CORE:
+        if index != 0:
+            use_wandb = False
+
+    if use_wandb:
+        wl = wandb_logger(wandb_pipe, index, "tw")
 
     def prep_batch(batch):
         # batch should be a torch tensor, uint8, 0-255, (B, H, W, C)
@@ -101,6 +153,17 @@ def tpu_worker(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue):
         else:
             print(f'tw-{index}: data processed in {finish_time - init_time} seconds, out shape {batch.shape}')
         out_data_pipe.put({'value': batch, 'meta': {'batch_id': data['meta']['batch_id'], 'aw_worker_index': data['meta']['aw_worker_index']}})
+        
+        if use_wandb:
+            # bps = batch per second (1 core)
+            wl.dlog("bps", 1 / (finish_time - init_time))
+            # fps = frame per second (1 core)
+            wl.dlog("fps", (1 / (finish_time - init_time)) * TPU_BATCH_SIZE)
+            if WANDB_ONLY_ONE_CORE:
+                # global bps = batch per second (all cores)
+                wl.g_dlog((1 / (finish_time - init_time)) * TPU_CORE_COUNT, "bps")
+                # global fps = frame per second (all cores)
+                wl.g_dlog(((1 / (finish_time - init_time)) * TPU_BATCH_SIZE) * TPU_CORE_COUNT, "fps")
 
 # Lock status:
 # 0: processing pending
@@ -108,8 +171,11 @@ def tpu_worker(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue):
 # 2: processed
 # 3: ignore
 
-def assign_worker(file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, index: int = 0):
+def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, wandb_pipe = mp.Queue):
     print("aw: started")
+
+    global USE_WANDB
+    use_wandb = copy.copy(USE_WANDB)
 
     while True:
         video_path, json_path = file_pipe.get()
@@ -183,6 +249,56 @@ def assign_worker(file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_data_pipe: mp
         torchvision.io.write_video(f'{SAVE_PATH}/{video_id}.mp4', final_out, v_metadata['video_fps'])
         print(f"aw: {video_path} - {SAVE_PATH}/{video_id}.mp4 saved")
 
+        if use_wandb:
+            wandb_pipe.put(
+                {
+                    'at': 'sum', 
+                    'c': {
+                        'name': 'aw/videos',
+                        'value': 1
+                    }
+                }
+            )
+
+def wandb_worker(wandb_pipe: mp.Queue):
+    wandb_run = wandb.init(
+        project=WANDB_PROJ, 
+        entity=WANDB_ENTITY,
+        config={
+            "FILE_PIPE_MAX": FILE_PIPE_MAX,
+            "IN_DATA_PIPE_MAX": IN_DATA_PIPE_MAX,
+            "OUT_DATA_PIPE_MAX": OUT_DATA_PIPE_MAX,
+            "ASSIGN_WORKERS": ASSIGN_WORKERS,
+            "TPU_CORE_COUNT": TPU_CORE_COUNT,
+            "TPU_BATCH_SIZE": TPU_BATCH_SIZE,
+            "C_H": C_H,
+            "C_W": C_W,
+        },
+        name=f"{CODENAME}_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
+        )
+
+    start_time = time.time()
+    
+    local_vars = {}
+
+    while True:
+        data = wandb_pipe.get()
+        if data is None:
+            break
+        access_type = data['at'] # access type
+        content = data['c'] # content
+        curr_time = time.time()
+        time_diff = int(curr_time - start_time)
+
+        if access_type == "direct":
+            wandb_run.log(content, step = time_diff)
+        elif access_type == "sum":
+            if content['name'] in local_vars:
+                local_vars[content['name']] += content['value']
+            else:
+                local_vars[content['name']] = content['value']
+            wandb_run.log({content['name']: local_vars[content['name']]}, step = time_diff)
+
 def main():
     print("Initializing...")
     global manager
@@ -192,24 +308,36 @@ def main():
     out_data_pipe = manager.Queue(OUT_DATA_PIPE_MAX)
     print("Objects created")
     assign_workers = list()
+
+    if USE_WANDB:
+        wandb_pipe = manager.Queue()
+        wandb_worker_process = mp.Process(target=wandb_worker, args=(wandb_pipe,))
+        wandb_worker_process.start()
+        print("Wandb worker started")
+    else:
+        wandb_pipe = None
+
     for i in range(ASSIGN_WORKERS):
-        assign_worker_process = mp.Process(target=assign_worker, args=(file_pipe, in_data_pipe, out_data_pipe, i,))
+        assign_worker_process = mp.Process(target=assign_worker, args=(i, file_pipe, in_data_pipe, out_data_pipe, wandb_pipe,))
         assign_worker_process.start()
         assign_workers.append(assign_worker_process)
         print(f"Assign worker {i} started")
+
     print("Assign workers started")
+
     disk_reader_worker = mp.Process(target=disk_reader, args=(file_pipe,))
     disk_reader_worker.start()
     print("Disk reader started")
-    # for i in range(TPU_CORE_COUNT):
-    #     tpu_worker_process = mp.Process(target=tpu_worker, args=(i, in_data_pipe, out_data_pipe,))
-    #     tpu_worker_process.start()
+
     print("starting TPU workers (forced join, idk why???)")
-    xmp_obj = xmp.spawn(tpu_worker, args=(in_data_pipe, out_data_pipe,), nprocs=TPU_CORE_COUNT)
+    xmp_obj = xmp.spawn(tpu_worker, args=(in_data_pipe, out_data_pipe, wandb_pipe,), nprocs=TPU_CORE_COUNT)
     print("TPU workers started")
+
     for worker in assign_workers:
         worker.join()
     disk_reader_worker.join()
+    if USE_WANDB:
+        wandb_worker_process.join()
     print("All workers joined, exiting")
 
 if __name__ == "__main__":

@@ -8,6 +8,8 @@
 *.npy
 *.db
 
+wandb
+
 im2im
 im2im-sswm
 
