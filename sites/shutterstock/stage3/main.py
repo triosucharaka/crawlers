@@ -165,12 +165,6 @@ def tpu_worker(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, wandb_pip
                 # global fps = frame per second (all cores)
                 wl.g_dlog(((1 / (finish_time - init_time)) * TPU_BATCH_SIZE) * TPU_CORE_COUNT, "fps")
 
-# Lock status:
-# 0: processing pending
-# 1: processing
-# 2: processed
-# 3: ignore
-
 def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, wandb_pipe = mp.Queue):
     print("aw: started")
 
@@ -225,8 +219,6 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
         print(f"aw: {video_path} - batches sent to TPU workers")
 
         output_superbatch = list()
-        # for i in range(superbatch_count):
-        #     output_superbatch.append(None)
 
         while len(batch_ids_to_retrieve) > 0:
             batch = out_data_pipe.get()
