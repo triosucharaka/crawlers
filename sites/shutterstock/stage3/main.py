@@ -12,6 +12,8 @@ import torchvision
 import torchvision.transforms.functional as F
 import wandb
 import copy
+import gc
+mp.set_start_method("spawn", force=True)
 
 """
 v1 - wonderhoy
@@ -23,10 +25,10 @@ CODENAME = "wonderhoy"
 ## General
 DISK_PATH = "/mnt/disks/hhd/tango/videos"
 SAVE_PATH = "/home/windowsuser/test"
-FILE_PIPE_MAX = 20
-IN_DATA_PIPE_MAX = 250
-OUT_DATA_PIPE_MAX = 250
-ASSIGN_WORKERS = 4
+FILE_PIPE_MAX = 4
+IN_DATA_PIPE_MAX = 256
+OUT_DATA_PIPE_MAX = 256
+ASSIGN_WORKERS = 2
 
 ## Wandb
 
@@ -51,6 +53,7 @@ DEBUG = False
 DR_DELAY = 0.1
 
 def disk_reader(file_pipe: mp.Queue):
+    gc_obj = 0
     print("dr: started")
     dir_list = os.listdir(DISK_PATH)
     print(f"dr: dir list loaded, {len(dir_list)} files found")
@@ -64,9 +67,13 @@ def disk_reader(file_pipe: mp.Queue):
         input_obj = (f'{DISK_PATH}/{file}', f'{DISK_PATH}/{filename}.json')
         file_pipe.put(input_obj)
         print(f"dr: {filename} sent to assign worker")
+        del input_obj, filename, fileextension
+        gc_obj += gc.collect()
         if DEBUG:
             time.sleep(DR_DELAY)
-    print("dr: all files loaded, sending termination signal")
+    del dir_list
+    gc_obj += gc.collect()
+    print(f"dr: all files loaded, sending termination signal, gc: {gc_obj} objects collected")
     for i in range(TPU_CORE_COUNT):
         file_pipe.put((None, None))
 
@@ -118,20 +125,25 @@ def tpu_worker(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, wandb_pip
         batch = batch.permute(0,3,1,2) # (B, H, W, C) -> (B, C, H, W)
         batch = batch.to(device).to(torch.float32).div(255).to(memory_format=torch.contiguous_format) # batch is now a tensor, float32, 0-1
         _bs, _c, _h, _w = batch.shape
-        # batch size must be managed by the encoder process manager (ENC-PM)
         right = math.ceil(_w / model.ksize) * model.ksize - _w
         bottom = math.ceil(_h / model.ksize) * model.ksize - _h
         batch = torch.nn.functional.pad(batch, [0, right, 0, bottom], mode = 'reflect')
+        del right
+        del bottom
+        gc.collect()
         return batch, _h, _w
     
     def post_batch(batch, _h, _w):
         batch = batch[:,:,0:_h,0:_w]
         batch = batch.mul(255).round().clamp(0,255).permute(0,2,3,1).to(device = 'cpu', dtype = torch.uint8).numpy() # (B, C, H, W) -> (B, H, W, C) # batch is now a numpy array, uint8, 0-255
+        del _h, _w
+        gc.collect()
         return batch
 
     print(f'tw-{index}: init signal received')
     first_run = True # first run is always compilation 
     while True:
+        gc_obj = 0
         data = in_data_pipe.get() # (B, H, W, C)
         if data is None:
             break
@@ -165,6 +177,10 @@ def tpu_worker(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, wandb_pip
                 # global fps = frame per second (all cores)
                 wl.g_dlog(((1 / (finish_time - init_time)) * TPU_BATCH_SIZE) * TPU_CORE_COUNT, "fps")
 
+        del value, batch, data, init_time, finish_time, _h, _w
+        gc_obj += gc.collect()
+        print(f'tw-{index}: data processed, {gc_obj} objects collected')
+
 def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, wandb_pipe = mp.Queue):
     print("aw: started")
 
@@ -172,6 +188,9 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
     use_wandb = copy.copy(USE_WANDB)
 
     while True:
+        gc_obj = 0
+
+        print(f"aw: {index} waiting for file")
         video_path, json_path = file_pipe.get()
         print(f"aw: {video_path} received")
         if video_path is None and json_path is None:
@@ -184,11 +203,16 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
         frame_count = frames.shape[0]
         print(f"aw: {video_path} video loaded")
 
+        del _
+
         if frame_count < TPU_BATCH_SIZE:
             print(f"aw: {video_path} - {frame_count} < {TPU_BATCH_SIZE}, skipping")
             continue
 
-        j_metadata = json.load(open(json_path, 'r'))
+        with open(json_path, 'r') as f:
+            j_metadata = json.load(f)
+
+        del json_path
 
         # batch = (f, f, f, f, .. 16 times) # 16 frames
         # superbatch = (b, b, b, b, ...Y times) # Y splits where Y is the frame_count // TPU_BATCH_SIZE
@@ -216,7 +240,11 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
             # I EXPECT (B, H, W, C) AKA (16, 256, 256, 3)!!!!
             # batch should be a numpy array, uint8, 0-255, (B, H, W, C)
             print(f"aw: {video_path} - batch {i} sent with sahpe {batch['value'].shape}")
+            del batch
         print(f"aw: {video_path} - batches sent to TPU workers")
+
+        del frames, superbatch_count
+        gc_obj += gc.collect()
 
         output_superbatch = list()
 
@@ -230,6 +258,7 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
             # add batch at the correct index
             output_superbatch.append({"o": batch_id, "v": batch['value']})
             print(f"aw: {video_path} - batch {batch_id} received")
+            del batch, batch_id
         # order
         output_superbatch.sort(key=lambda x: x['o'])
         output_superbatch = [x['v'] for x in output_superbatch]
@@ -272,6 +301,10 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
                 }
             )
 
+        del output_superbatch, video_id, batch_ids_to_retrieve, final_out, v_metadata, j_metadata, frame_count
+        gc_obj += gc.collect()
+        print(f"aw: {video_path} - done, {gc_obj} objects collected")
+
 def wandb_worker(wandb_pipe: mp.Queue):
     wandb_run = wandb.init(
         project=WANDB_PROJ, 
@@ -311,8 +344,16 @@ def wandb_worker(wandb_pipe: mp.Queue):
                 local_vars[content['name']] = content['value']
             wandb_run.log({content['name']: local_vars[content['name']]}, step = time_diff)
 
+        del data
+        del access_type
+        del content
+        del curr_time
+        del time_diff
+        gc.collect()
+
 def main():
     print("Initializing...")
+    print(f"Start method is {mp.get_start_method()}")
     global manager
     manager = mp.Manager()
     file_pipe = manager.Queue(FILE_PIPE_MAX)
