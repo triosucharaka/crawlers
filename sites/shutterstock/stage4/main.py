@@ -17,9 +17,9 @@ import gc
 mp.set_start_method("spawn", force=True)
 
 """
-v1 - wonderhoy
+v1 - ghostfood
 """
-CODENAME = "wonderhoy"
+CODENAME = "ghostfood"
 
 # config
 
