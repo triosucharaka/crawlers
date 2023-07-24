@@ -279,7 +279,7 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
         video_id = j_metadata['id']
 
         final_out = np.concatenate(output_superbatch, axis=0) # batch should be a numpy array, uint8, 0-255, (B, H, W, C)
-        #torchvision.io.write_video(f'{SAVE_PATH}/{video_id}.mp4', final_out, v_metadata['video_fps'])
+        torchvision.io.write_video(f'{SAVE_PATH}/{video_id}.mp4', final_out, v_metadata['video_fps'])
         print(f"aw-{index}: {video_path} - {SAVE_PATH}/{video_id}.mp4 saved")
 
         if use_wandb:

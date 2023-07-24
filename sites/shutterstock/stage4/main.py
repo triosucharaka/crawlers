@@ -2,22 +2,19 @@ import multiprocessing as mp
 import time
 import json
 import os
-import math
-import torch_xla.core.xla_model as xm
-import torch_xla.distributed.xla_multiprocessing as xmp
-import torch
-from im2im.main import load_model
 import numpy as np
 import torchvision
 import torchvision.transforms.functional as F
 import wandb
 import copy
-import tracemalloc
 import gc
+import numpy as np
+
 mp.set_start_method("spawn", force=True)
 
 """
 v1 - ghostfood
+https://www.youtube.com/watch?v=fBXMGe5mNCE
 """
 CODENAME = "ghostfood"
 
@@ -37,15 +34,18 @@ global USE_WANDB
 
 USE_WANDB = True
 WANDB_ENTITY = "tempofunk" # none if not using wandb
-WANDB_PROJ = "shutterstock_stage3"
+WANDB_PROJ = "shutterstock_stage4"
 WANDB_ONLY_ONE_CORE = True
 
 ## TPU Workers
 TPU_CORE_COUNT = 8
-TPU_BATCH_SIZE = 16
+TPU_BATCH_SIZE = 32
 MAX_SUPERBATCHES = 30
-IM2IM_MODEL_PATH = "im2im-sswm"
+MIN_SUPERBATCHES = TPU_CORE_COUNT / ASSIGN_WORKERS
 
+VAE_MODEL_PATH = "CompVis/stable-diffusion-v1-4"
+VAE_MODEL_REVISION = "flax"
+VAE_MODEL_SUBFOLDER = "vae"
 C_C = 3
 C_H = 384 # (divisible by 64)
 C_W = 640 # (divisible by 64)
@@ -56,6 +56,19 @@ DR_DELAY = 0.1
 
 ## tmp
 SNAPSHOT_DIR = "/home/windowsuser/crawlers/sites/shutterstock/stage3/snapshots"
+
+"""
+Per Image               |  Total Time Taken (10 rounds)| Devices; Batch Size
+0.007594532426446676        19.441503763198853          8; 32
+0.007988434843719005        20.449864387512207          8; 32
+0.007887406926602124        20.19119167327881           8; 32
+0.013347899541258812        17.084990739822388          8; 16
+0.013619952462613582        17.433118104934692          8; 16
+0.012901734933257103        16.51395297050476           8; 16
+0.013376232236623764        8.560500860214233           8; 8
+0.013047899678349495        8.350401401519775           8; 8
+0.012519768625497817        8.012182235717773           8; 8
+"""
 
 def disk_reader(file_pipe: mp.Queue):
     gc_obj = 0
@@ -109,91 +122,106 @@ class wandb_logger:
         )
 
 def tpu_worker(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, wandb_pipe: mp.Queue = None):
-    tracemalloc.start()
-    print(f'tw-{index}: started, grabbing device {index}')
-    device = xm.xla_device()
-    print(f'tw-{index}: device {index} successfully grabbed')
-    model = load_model(IM2IM_MODEL_PATH, device)
+    from diffusers import FlaxAutoencoderKL
+    import jax.numpy as jnp
+    import jax
+    weight_dtype = jnp.float16
+    vae, vae_params = FlaxAutoencoderKL.from_pretrained(
+        VAE_MODEL_PATH,
+        revision=VAE_MODEL_REVISION,
+        subfolder=VAE_MODEL_SUBFOLDER,
+        dtype=weight_dtype,
+    )
     print(f'tw-{index}: model loaded')
 
     global USE_WANDB
     use_wandb = copy.copy(USE_WANDB)
 
-    if WANDB_ONLY_ONE_CORE:
-        if index != 0:
-            use_wandb = False
+    # if WANDB_ONLY_ONE_CORE:
+    #     if index != 0:
+    #         use_wandb = False
+    # only one process since we use jax.pmap to split the batch
 
     if use_wandb:
         wl = wandb_logger(wandb_pipe, index, "tw")
 
+    expected_input_shape = (TPU_CORE_COUNT, TPU_BATCH_SIZE, C_C, C_H, C_W)
+
     def prep_batch(batch):
-        # batch should be a torch tensor, uint8, 0-255, (B, H, W, C)
-        batch = batch.permute(0,3,1,2) # (B, H, W, C) -> (B, C, H, W)
-        batch = batch.to(device).to(torch.float32).div(255).to(memory_format=torch.contiguous_format) # batch is now a tensor, float32, 0-1
-        _bs, _c, _h, _w = batch.shape
-        right = math.ceil(_w / model.ksize) * model.ksize - _w
-        bottom = math.ceil(_h / model.ksize) * model.ksize - _h
-        batch = torch.nn.functional.pad(batch, [0, right, 0, bottom], mode = 'reflect')
-        del right
-        del bottom
-        gc.collect()
-        return batch, _h, _w
-    
-    def post_batch(batch, _h, _w):
-        batch = batch[:,:,0:_h,0:_w]
-        batch = batch.mul(255).round().clamp(0,255).permute(0,2,3,1).to(device = 'cpu', dtype = torch.uint8).numpy() # (B, C, H, W) -> (B, H, W, C) # batch is now a numpy array, uint8, 0-255
-        del _h, _w
+        # (D, B, C, H, W) (uint8) (0-255)
+        assert batch.dtype == np.uint8, f"{batch.dtype} != uint8"
+        assert batch.max() <= 255, f"{batch.max()} > 255"
+        assert batch.min() >= 0, f"{batch.min()} < 0"
+        assert batch.shape == expected_input_shape, f"{batch.shape} != {expected_input_shape}"
+        batch = batch.astype(np.float32)
+        batch = batch / 255.0 # (D, B, C, H, W) (float32) (0-1)
+        assert batch.dtype == np.float32, f"{batch.dtype} != float32"
+        assert batch.max() <= 1.0, f"{batch.max()} > 1.0"
+        assert batch.min() >= 0.0, f"{batch.min()} < 0.0"
         gc.collect()
         return batch
-
-    print(f'tw-{index}: init signal received')
+    
+    def encode(img, rng, vae_params):
+        latent_dist = vae.apply({"params": vae_params}, img, method=vae.encode).latent_dist
+        return latent_dist.sample(key=rng).transpose((0, 3, 1, 2))
+    
+    def create_key(seed=0):
+        return jax.random.PRNGKey(seed)
+    rng = create_key(0)
+    
+    model = jax.pmap(encode, in_axes=(0, None, None))
     first_run = True # first run is always compilation 
+    print(f'tw-{index}: starting run...')
+
     while True:
         gc_obj = 0
-        data = in_data_pipe.get() # (B, H, W, C)
-        if data is None:
-            break
+        np_batch = list()
+        data_batch = list()
+
+        for i in range(TPU_CORE_COUNT):
+            data = in_data_pipe.get() # (B, C, H, W) (uint8) (0-255)
+            if data is None:
+                break
+            np_batch.append(data['value'])
+            data_batch.append(data['meta'])
+
+        np_batch = np.stack(np_batch)
+
         if first_run:
             print(f'tw-{index}: first run, is always compilation')
+
         print(f'tw-{index}: data received')
         init_time = time.time()
-        value = torch.from_numpy(data['value']) # pipe is always numpy to avoid problems
-        value, _h, _w = prep_batch(value) # prep_batch expects torch
-        print(f'tw-{index}: data preprocessed, end shape {value.shape}, dtype {value.dtype}, device {value.device}, range {value.min()} - {value.max()}')
-        #batch = model(value)
-        batch = value
-        print(f'tw-{index}: data modeled, out shape {batch.shape}, dtype {batch.dtype}, device {batch.device}, range {batch.min()} - {batch.max()}')
-        batch = post_batch(batch, _h, _w)
-        #batch = out.numpy(force=True)
+        value = prep_batch(np_batch) # converts to float32, 0-1
+
+        print(f'tw-{index}: data preprocessed, end shape {value.shape}, dtype {value.dtype}, range {value.min()} - {value.max()}')
+
+        output = model(value, rng, vae_params)
+
+        print(f'tw-{index}: data modeled, out shape {output.shape}, dtype {output.dtype}, range {output.min()} - {output.max()}')
+
         finish_time = time.time()
         if first_run:
             first_run = False
-            print(f'tw-{index}: compilation done in {finish_time - init_time} seconds, out shape {batch.shape}')
+            print(f'tw-{index}: compilation done in {finish_time - init_time} seconds, out shape {output.shape}')
         else:
-            print(f'tw-{index}: data processed in {finish_time - init_time} seconds, out shape {batch.shape}')
-        out_data_pipe.put({'value': batch, 'meta': {'batch_id': data['meta']['batch_id'], 'aw_worker_index': data['meta']['aw_worker_index']}})
+            print(f'tw-{index}: data processed in {finish_time - init_time} seconds, out shape {output.shape}')
+
+        for i in range(TPU_CORE_COUNT):
+            out_data_pipe.put({'value': output[i], 'meta': data_batch[i]})
+            # output should be:
+            # (B, C, H, W) (float32) (0-1)
+            # (32, 4, 64, 64) (float32) (0-1)
         
         if use_wandb:
             # bps = batch per second (1 core)
-            wl.dlog("bps", 1 / (finish_time - init_time))
+            wl.dlog("bps", 1 / (finish_time - init_time) * TPU_CORE_COUNT)
             # fps = frame per second (1 core)
-            wl.dlog("fps", (1 / (finish_time - init_time)) * TPU_BATCH_SIZE)
-            if WANDB_ONLY_ONE_CORE:
-                # global bps = batch per second (all cores)
-                wl.g_dlog((1 / (finish_time - init_time)) * TPU_CORE_COUNT, "bps")
-                # global fps = frame per second (all cores)
-                wl.g_dlog(((1 / (finish_time - init_time)) * TPU_BATCH_SIZE) * TPU_CORE_COUNT, "fps")
+            wl.dlog("fps", (1 / (finish_time - init_time) * TPU_CORE_COUNT) * TPU_BATCH_SIZE)
 
-        del value, batch, data, init_time, finish_time, _h, _w
+        del value, data, init_time, finish_time
         gc_obj += gc.collect()
         print(f'tw-{index}: data processed, {gc_obj} objects collected')
-
-        snapshot = tracemalloc.take_snapshot()
-        top_stats = snapshot.statistics('lineno')
-        stat_idx = 0
-        for stat in top_stats[:10]:
-            print(f"tw-{index}/{stat_idx}", stat)
-            stat_idx += 1
 
 def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, wandb_pipe = mp.Queue):
     print(f"aw-{index}: started")
@@ -235,6 +263,9 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
         superbatch_count = frame_count // TPU_BATCH_SIZE
         if superbatch_count > MAX_SUPERBATCHES:
             superbatch_count = MAX_SUPERBATCHES
+        if superbatch_count < MIN_SUPERBATCHES:
+            print(f"aw-{index}: {video_path} - {superbatch_count} < {MIN_SUPERBATCHES} superbatch, skipping")
+            continue
         print(f"aw-{index}: {video_path} - using {superbatch_count * TPU_BATCH_SIZE}/{frame_count} frames, {superbatch_count} megabatches")
 
         batches_sent = 0
@@ -242,19 +273,17 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
         print(f"aw-{index}: {video_path} - sending batches to TPU workers")
         for i in range(superbatch_count):
             batch = frames[range(i * TPU_BATCH_SIZE, (i + 1) * TPU_BATCH_SIZE)]
-            batch = batch.permute(0,2,3,1) # (B, C, H, W) -> (B, H, W, C)
-            # I don't think permute latency matters that much, yes its done twice but at most its 1ms of extra latency
-            # https://oneflow2020.medium.com/how-to-implement-a-permute-transpose-op-6-times-faster-than-pytorch-6280d63d0b4b
+            # should be a torch tensor, uint8, 0-255, (B, C, H, W)
             batch = batch.numpy(force=True)
-            assert batch.shape[3] == C_C
+            assert batch.shape[1] == C_C
             assert batch.shape[0] == TPU_BATCH_SIZE
             assert batch.dtype == np.uint8
             assert batch.min() >= 0
             assert batch.max() <= 255
             batch = {'value': batch, 'meta': {'batch_id': i, 'aw_worker_index': index}}
-            in_data_pipe.put(batch) 
-            # I EXPECT (B, H, W, C) AKA (16, 256, 256, 3)!!!!
-            # batch should be a numpy array, uint8, 0-255, (B, H, W, C)
+            in_data_pipe.put(batch)
+            # input should be:
+            # (B, C, H, W) (uint8) (0-255)
             print(f"aw-{index}: {video_path} - batch {i} sent with sahpe {batch['value'].shape}")
             batches_sent += 1
             del batch
@@ -269,6 +298,8 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
             batch = out_data_pipe.get()
             if batch['meta']['aw_worker_index'] != index:
                 out_data_pipe.put(batch)
+                #unlike the dewatermarker, this will return a vae latent
+                #which has a shape of (F, C, H, W) aka (16, 4, 64, 64)
                 # sleep for (20-100 ms)
                 print(f"aw-{index}: {video_path} - obtained a workload meant for {batch['meta']['aw_worker_index']}, sleeping for a bit (20-100 ms")
                 rand_time = np.random.randint(20, 100) / 1000
@@ -287,9 +318,11 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
 
         video_id = j_metadata['id']
 
-        final_out = np.concatenate(output_superbatch, axis=0) # batch should be a numpy array, uint8, 0-255, (B, H, W, C)
-        #torchvision.io.write_video(f'{SAVE_PATH}/{video_id}.mp4', final_out, v_metadata['video_fps'])
-        print(f"aw-{index}: {video_path} - {SAVE_PATH}/{video_id}.mp4 saved")
+        final_out = np.concatenate(output_superbatch, axis=0) # batch should be a numpy array, (F, C, W, H) containing all frames in latent form
+        assert final_out.shape[0] == superbatch_count * TPU_BATCH_SIZE
+        assert final_out.shape[1] == C_C
+        np.save(f"{SAVE_PATH}/{video_id}.npy", final_out)
+        print(f"aw-{index}: {video_path} - {SAVE_PATH}/{video_id}.npy saved")
 
         if use_wandb:
             wandb_pipe.put(
@@ -413,13 +446,19 @@ def main():
     disk_reader_worker.start()
     print("Disk reader started")
 
-    print("starting TPU workers (forced join, idk why???)")
-    xmp_obj = xmp.spawn(tpu_worker, args=(in_data_pipe, out_data_pipe, wandb_pipe,), nprocs=TPU_CORE_COUNT)
+    print("starting TPU worker")
+    tpu_worker_process = mp.Process(target=tpu_worker, args=(0, in_data_pipe, out_data_pipe, wandb_pipe,))
+    tpu_worker_process.start()
     print("TPU workers started")
-
-    for worker in assign_workers:
-        worker.join()
+    print("All workers started, up and running")
+    
     disk_reader_worker.join()
+    print("Disk reader joined")
+    for i in range(ASSIGN_WORKERS):
+        assign_workers[i].join()
+        print(f"Assign worker {i} joined")
+    tpu_worker_process.join()
+    print("TPU worker joined")
     if USE_WANDB:
         wandb_worker_process.join()
     print("All workers joined, exiting")
