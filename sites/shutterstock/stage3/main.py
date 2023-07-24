@@ -12,7 +12,6 @@ import torchvision
 import torchvision.transforms.functional as F
 import wandb
 import copy
-import tracemalloc
 import gc
 mp.set_start_method("spawn", force=True)
 
@@ -109,7 +108,6 @@ class wandb_logger:
         )
 
 def tpu_worker(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, wandb_pipe: mp.Queue = None):
-    tracemalloc.start()
     print(f'tw-{index}: started, grabbing device {index}')
     device = xm.xla_device()
     print(f'tw-{index}: device {index} successfully grabbed')
@@ -187,13 +185,6 @@ def tpu_worker(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, wandb_pip
         del value, batch, data, init_time, finish_time, _h, _w
         gc_obj += gc.collect()
         print(f'tw-{index}: data processed, {gc_obj} objects collected')
-
-        snapshot = tracemalloc.take_snapshot()
-        top_stats = snapshot.statistics('lineno')
-        stat_idx = 0
-        for stat in top_stats[:10]:
-            print(f"tw-{index}/{stat_idx}", stat)
-            stat_idx += 1
 
 def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, wandb_pipe = mp.Queue):
     print(f"aw-{index}: started")
