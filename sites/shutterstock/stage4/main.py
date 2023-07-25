@@ -43,6 +43,8 @@ TPU_BATCH_SIZE = 32
 MAX_SUPERBATCHES = 30
 MIN_SUPERBATCHES = TPU_CORE_COUNT / ASSIGN_WORKERS
 
+QUEUE_TIMEOUT = 0.5 # 500 ms
+
 VAE_MODEL_PATH = "CompVis/stable-diffusion-v1-4"
 VAE_MODEL_REVISION = "flax"
 VAE_MODEL_SUBFOLDER = "vae"
@@ -155,15 +157,20 @@ def tpu_worker(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, wandb_pip
         assert batch.shape == expected_input_shape, f"{batch.shape} != {expected_input_shape}"
         batch = batch.astype(np.float32)
         batch = batch / 255.0 # (D, B, C, H, W) (float32) (0-1)
+        # added 7/24/2023
+        batch = batch * 2.0 - 1.0
         assert batch.dtype == np.float32, f"{batch.dtype} != float32"
         assert batch.max() <= 1.0, f"{batch.max()} > 1.0"
-        assert batch.min() >= 0.0, f"{batch.min()} < 0.0"
+        assert batch.min() >= -1.0, f"{batch.min()} < -1.0"
         gc.collect()
         return batch
     
     def encode(img, rng, vae_params):
-        latent_dist = vae.apply({"params": vae_params}, img, method=vae.encode).latent_dist
-        return latent_dist.sample(key=rng).transpose((0, 3, 1, 2))
+        init_latent_dist = vae.apply({"params": vae_params}, img, method=vae.encode).latent_dist
+        latent_dist = init_latent_dist.sample(key=rng)
+        latent_dist = latent_dist.transpose((0, 3, 1, 2))
+        latent_dist = vae.config.scaling_factor * latent_dist
+        return latent_dist
     
     def create_key(seed=0):
         return jax.random.PRNGKey(seed)
@@ -173,17 +180,26 @@ def tpu_worker(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, wandb_pip
     first_run = True # first run is always compilation 
     print(f'tw-{index}: starting run...')
 
+    null_meta = {'batch_id': -1, 'aw_worker_index': -1}
+
     while True:
         gc_obj = 0
         np_batch = list()
         data_batch = list()
 
         for i in range(TPU_CORE_COUNT):
-            data = in_data_pipe.get() # (B, C, H, W) (uint8) (0-255)
-            if data is None:
-                break
-            np_batch.append(data['value'])
-            data_batch.append(data['meta'])
+            try:
+                data = in_data_pipe.get(timeout=QUEUE_TIMEOUT)
+                # (B, C, H, W) (uint8) (0-255)
+                if data is None:
+                    break
+                np_batch.append(data['value'])
+                data_batch.append(data['meta'])
+            except Exception:
+                print(f'tw-{index}: queue timeout, filling with random data')
+                data = np.random.randint(0, 255, size=(TPU_BATCH_SIZE, C_C, C_H, C_W), dtype=np.uint8)
+                np_batch.append(data)
+                data_batch.append(null_meta)
 
         np_batch = np.stack(np_batch)
 
@@ -192,11 +208,12 @@ def tpu_worker(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, wandb_pip
 
         print(f'tw-{index}: data received')
         init_time = time.time()
-        value = prep_batch(np_batch) # converts to float32, 0-1
+        value = prep_batch(np_batch) # converts to float32, -1 <-> 1
 
         print(f'tw-{index}: data preprocessed, end shape {value.shape}, dtype {value.dtype}, range {value.min()} - {value.max()}')
 
         output = model(value, rng, vae_params)
+        output = np.array(output) # (D, B, C, H, W) (float32)
 
         print(f'tw-{index}: data modeled, out shape {output.shape}, dtype {output.dtype}, range {output.min()} - {output.max()}')
 
@@ -208,7 +225,11 @@ def tpu_worker(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, wandb_pip
             print(f'tw-{index}: data processed in {finish_time - init_time} seconds, out shape {output.shape}')
 
         for i in range(TPU_CORE_COUNT):
-            out_data_pipe.put({'value': output[i], 'meta': data_batch[i]})
+            obt_out = output[i]
+            obt_dat = data_batch[i]
+            if obt_dat['batch_id'] == -1 and obt_dat['aw_worker_index'] == -1:
+                continue
+            out_data_pipe.put({'value': obt_out, 'meta': obt_dat})
             # output should be:
             # (B, C, H, W) (float32) (0-1)
             # (32, 4, 64, 64) (float32) (0-1)
@@ -284,10 +305,10 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
             in_data_pipe.put(batch)
             # input should be:
             # (B, C, H, W) (uint8) (0-255)
-            print(f"aw-{index}: {video_path} - batch {i} sent with sahpe {batch['value'].shape}")
+            print(f"aw-{index}: {video_path} - batch {i} sent with shape {batch['value'].shape}")
             batches_sent += 1
             del batch
-        print(f"aw-{index}: {video_path} - batches sent to TPU workers")
+        print(f"aw-{index}: {video_path} - {batches_sent} batches sent to TPU workers")
 
         del frames
         gc_obj += gc.collect()
@@ -301,8 +322,8 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
                 #unlike the dewatermarker, this will return a vae latent
                 #which has a shape of (F, C, H, W) aka (16, 4, 64, 64)
                 # sleep for (20-100 ms)
-                print(f"aw-{index}: {video_path} - obtained a workload meant for {batch['meta']['aw_worker_index']}, sleeping for a bit (20-100 ms")
-                rand_time = np.random.randint(20, 100) / 1000
+                print(f"aw-{index}: {video_path} - obtained a workload meant for {batch['meta']['aw_worker_index']}, sleeping for a bit (50-100 ms")
+                rand_time = np.random.randint(50, 100) / 1000
                 time.sleep(rand_time)
                 continue
             batch_id = batch['meta']['batch_id']
@@ -319,9 +340,9 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
         video_id = j_metadata['id']
 
         final_out = np.concatenate(output_superbatch, axis=0) # batch should be a numpy array, (F, C, W, H) containing all frames in latent form
-        assert final_out.shape[0] == superbatch_count * TPU_BATCH_SIZE
-        assert final_out.shape[1] == C_C
-        np.save(f"{SAVE_PATH}/{video_id}.npy", final_out)
+        expected_out_shape = (TPU_BATCH_SIZE * superbatch_count, 4, C_H/8, C_W/8)
+        assert final_out.shape == expected_out_shape, f"{final_out.shape} != {expected_out_shape}"
+        #np.save(f"{SAVE_PATH}/{video_id}.npy", final_out)
         print(f"aw-{index}: {video_path} - {SAVE_PATH}/{video_id}.npy saved")
 
         if use_wandb:
