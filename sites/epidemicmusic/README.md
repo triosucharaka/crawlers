@@ -1,5 +1,8 @@
 # EpidemicMusic
 
+# TODO:
+- fix memory leak
+
 # Stage 1: Mapping
 
 In this stage we map the site for URLs:Metadata pairs
