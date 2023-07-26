@@ -3,30 +3,56 @@ import time
 import json
 import os
 import numpy as np
-import torchvision
-import torchvision.transforms.functional as F
+import cv2
 import wandb
 import copy
 import gc
 import numpy as np
+import psutil
+import logging
+
+def get_memory():
+    mem_info = psutil.virtual_memory()
+    free_memory = f"SMU: {round(mem_info.used / 1024 ** 2, 2)}MB; {mem_info.percent}" 
+    return free_memory
+
+class CustomLogger(logging.LoggerAdapter):
+    def process(self, msg, kwargs):
+        return f'{get_memory()} - {msg}', kwargs
+
+logger = logging.getLogger(__name__)
+c_handler = logging.StreamHandler()
+f_handler = logging.FileHandler('file.log')
+c_format = logging.Formatter(f'%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+f_format = logging.Formatter(f'%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+c_handler.setFormatter(c_format)
+f_handler.setFormatter(f_format)
+logger.addHandler(c_handler)
+logger.addHandler(f_handler)
+logger.setLevel(logging.DEBUG)
+logger = CustomLogger(logger, {})
+
 
 mp.set_start_method("spawn", force=True)
 
 """
 v1 - ghostfood
 https://www.youtube.com/watch?v=fBXMGe5mNCE
+v1-test1 - toerina
+to see how much memory it eats
+v1-1-prod - ghostfood
 """
-CODENAME = "ghostfood"
+CODENAME = "notv-threads-toerina"
 
 # config
 
 ## General
 DISK_PATH = "/mnt/disks/hhd/tango/videos"
 SAVE_PATH = "/home/windowsuser/test"
-FILE_PIPE_MAX = 4
-IN_DATA_PIPE_MAX = 80
-OUT_DATA_PIPE_MAX = 80
-ASSIGN_WORKERS = 2
+FILE_PIPE_MAX = 2
+IN_DATA_PIPE_MAX = 256
+OUT_DATA_PIPE_MAX = 256
+ASSIGN_WORKERS = 1
 
 ## Wandb
 
@@ -74,26 +100,26 @@ Per Image               |  Total Time Taken (10 rounds)| Devices; Batch Size
 
 def disk_reader(file_pipe: mp.Queue):
     gc_obj = 0
-    print("dr: started")
+    logger.info("dr: started")
     dir_list = os.listdir(DISK_PATH)
-    print(f"dr: dir list loaded, {len(dir_list)} files found")
+    logger.info(f"dr: dir list loaded, {len(dir_list)} files found")
     for file in dir_list:
         filename, fileextension = os.path.splitext(file)
         if fileextension == ".json":
             continue
         if not os.path.exists(f'{DISK_PATH}/{filename}.json'):
-            print(f"dr: {filename}.json not found, skipping")
+            logger.info(f"dr: {filename}.json not found, skipping")
             continue
         input_obj = (f'{DISK_PATH}/{file}', f'{DISK_PATH}/{filename}.json')
         file_pipe.put(input_obj)
-        print(f"dr: {filename} sent to assign worker")
+        logger.info(f"dr: {filename} sent to assign worker")
         del input_obj, filename, fileextension
         gc_obj += gc.collect()
         if DEBUG:
             time.sleep(DR_DELAY)
     del dir_list
     gc_obj += gc.collect()
-    print(f"dr: all files loaded, sending termination signal, gc: {gc_obj} objects collected")
+    logger.info(f"dr: all files loaded, sending termination signal, gc: {gc_obj} objects collected")
     for i in range(TPU_CORE_COUNT):
         file_pipe.put((None, None))
 
@@ -134,7 +160,7 @@ def tpu_worker(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, wandb_pip
         subfolder=VAE_MODEL_SUBFOLDER,
         dtype=weight_dtype,
     )
-    print(f'tw-{index}: model loaded')
+    logger.info(f'tw-{index}: model loaded')
 
     global USE_WANDB
     use_wandb = copy.copy(USE_WANDB)
@@ -178,7 +204,7 @@ def tpu_worker(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, wandb_pip
     
     model = jax.pmap(encode, in_axes=(0, None, None))
     first_run = True # first run is always compilation 
-    print(f'tw-{index}: starting run...')
+    logger.info(f'tw-{index}: starting run...')
 
     null_meta = {'batch_id': -1, 'aw_worker_index': -1}
 
@@ -196,7 +222,7 @@ def tpu_worker(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, wandb_pip
                 np_batch.append(data['value'])
                 data_batch.append(data['meta'])
             except Exception:
-                print(f'tw-{index}: queue timeout, filling with random data')
+                logger.info(f'tw-{index}: queue timeout, filling with random data')
                 data = np.random.randint(0, 255, size=(TPU_BATCH_SIZE, C_C, C_H, C_W), dtype=np.uint8)
                 np_batch.append(data)
                 data_batch.append(null_meta)
@@ -204,25 +230,25 @@ def tpu_worker(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, wandb_pip
         np_batch = np.stack(np_batch)
 
         if first_run:
-            print(f'tw-{index}: first run, is always compilation')
+            logger.info(f'tw-{index}: first run, is always compilation')
 
-        print(f'tw-{index}: data received')
+        logger.info(f'tw-{index}: data received')
         init_time = time.time()
         value = prep_batch(np_batch) # converts to float32, -1 <-> 1
 
-        print(f'tw-{index}: data preprocessed, end shape {value.shape}, dtype {value.dtype}, range {value.min()} - {value.max()}')
+        logger.info(f'tw-{index}: data preprocessed, end shape {value.shape}, dtype {value.dtype}, range {value.min()} - {value.max()}')
 
         output = model(value, rng, vae_params)
         output = np.array(output) # (D, B, C, H, W) (float32)
 
-        print(f'tw-{index}: data modeled, out shape {output.shape}, dtype {output.dtype}, range {output.min()} - {output.max()}')
+        logger.info(f'tw-{index}: data modeled, out shape {output.shape}, dtype {output.dtype}, range {output.min()} - {output.max()}')
 
         finish_time = time.time()
         if first_run:
             first_run = False
-            print(f'tw-{index}: compilation done in {finish_time - init_time} seconds, out shape {output.shape}')
+            logger.info(f'tw-{index}: compilation done in {finish_time - init_time} seconds, out shape {output.shape}')
         else:
-            print(f'tw-{index}: data processed in {finish_time - init_time} seconds, out shape {output.shape}')
+            logger.info(f'tw-{index}: data processed in {finish_time - init_time} seconds, out shape {output.shape}')
 
         for i in range(TPU_CORE_COUNT):
             obt_out = output[i]
@@ -242,10 +268,10 @@ def tpu_worker(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, wandb_pip
 
         del value, data, init_time, finish_time
         gc_obj += gc.collect()
-        print(f'tw-{index}: data processed, {gc_obj} objects collected')
+        logger.info(f'tw-{index}: data processed, {gc_obj} objects collected')
 
 def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, wandb_pipe = mp.Queue):
-    print(f"aw-{index}: started")
+    logger.info(f"aw-{index}: started")
 
     global USE_WANDB
     use_wandb = copy.copy(USE_WANDB)
@@ -253,23 +279,35 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
     while True:
         gc_obj = 0
 
-        print(f"aw-{index}: {index} waiting for file")
+        logger.info(f"aw-{index}: {index} waiting for file")
         video_path, json_path = file_pipe.get()
-        print(f"aw-{index}: {video_path} received")
+        logger.info(f"aw-{index}: {video_path} received")
         if video_path is None and json_path is None:
-            print(f"aw-{index}: termination signal received")
+            logger.info(f"aw-{index}: termination signal received")
             for i in range(TPU_CORE_COUNT):
                 in_data_pipe.put(None)
             break
-        frames, _, v_metadata = torchvision.io.read_video(video_path, output_format="TCHW")
-        frames = F.resize(frames, (C_H, C_W))
-        frame_count = frames.shape[0]
-        print(f"aw-{index}: {video_path} video loaded")
 
-        del _
+        logger.info(f"aw-{index}: {video_path} loading video")
+        video_cap = cv2.VideoCapture(video_path)
+        logger.info(f"aw-{index}: {video_path} video loaded")
+        resized_frames = []
+        while True:
+            ret, frame = video_cap.read()
+            if not ret:
+                break
+            resized_frame = cv2.resize(frame, (C_W, C_H))
+            numpy_frame = np.array(resized_frame)
+            resized_frames.append(numpy_frame)
+        frames = np.array(resized_frames)
+        logger.info(f"aw-{index}: {video_path} video resized")
+        frames = frames.transpose((0, 3, 1, 2)) # (F, C, H, W)
+        logger.info(f"aw-{index}: {video_path} video transposed")
+        frame_count = frames.shape[0]
+        logger.info(f"aw-{index}: {video_path} video ready")
 
         if frame_count < TPU_BATCH_SIZE:
-            print(f"aw-{index}: {video_path} - {frame_count} < {TPU_BATCH_SIZE}, skipping")
+            logger.info(f"aw-{index}: {video_path} - {frame_count} < {TPU_BATCH_SIZE}, skipping")
             continue
 
         with open(json_path, 'r') as f:
@@ -285,17 +323,17 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
         if superbatch_count > MAX_SUPERBATCHES:
             superbatch_count = MAX_SUPERBATCHES
         if superbatch_count < MIN_SUPERBATCHES:
-            print(f"aw-{index}: {video_path} - {superbatch_count} < {MIN_SUPERBATCHES} superbatch, skipping")
+            logger.info(f"aw-{index}: {video_path} - {superbatch_count} < {MIN_SUPERBATCHES} superbatch, skipping")
             continue
-        print(f"aw-{index}: {video_path} - using {superbatch_count * TPU_BATCH_SIZE}/{frame_count} frames, {superbatch_count} megabatches")
+        logger.info(f"aw-{index}: {video_path} - using {superbatch_count * TPU_BATCH_SIZE}/{frame_count} frames, {superbatch_count} megabatches")
 
         batches_sent = 0
 
-        print(f"aw-{index}: {video_path} - sending batches to TPU workers")
+        logger.info(f"aw-{index}: {video_path} - sending batches to TPU workers")
         for i in range(superbatch_count):
             batch = frames[range(i * TPU_BATCH_SIZE, (i + 1) * TPU_BATCH_SIZE)]
             # should be a torch tensor, uint8, 0-255, (B, C, H, W)
-            batch = batch.numpy(force=True)
+            #batch = batch.numpy(force=True)
             assert batch.shape[1] == C_C
             assert batch.shape[0] == TPU_BATCH_SIZE
             assert batch.dtype == np.uint8
@@ -305,10 +343,10 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
             in_data_pipe.put(batch)
             # input should be:
             # (B, C, H, W) (uint8) (0-255)
-            print(f"aw-{index}: {video_path} - batch {i} sent with shape {batch['value'].shape}")
+            logger.info(f"aw-{index}: {video_path} - batch {i} sent with shape {batch['value'].shape}")
             batches_sent += 1
             del batch
-        print(f"aw-{index}: {video_path} - {batches_sent} batches sent to TPU workers")
+        logger.info(f"aw-{index}: {video_path} - {batches_sent} batches sent to TPU workers")
 
         del frames
         gc_obj += gc.collect()
@@ -322,7 +360,7 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
                 #unlike the dewatermarker, this will return a vae latent
                 #which has a shape of (F, C, H, W) aka (16, 4, 64, 64)
                 # sleep for (20-100 ms)
-                print(f"aw-{index}: {video_path} - obtained a workload meant for {batch['meta']['aw_worker_index']}, sleeping for a bit (50-100 ms")
+                logger.info(f"aw-{index}: {video_path} - obtained a workload meant for {batch['meta']['aw_worker_index']}, sleeping for a bit (50-100 ms")
                 rand_time = np.random.randint(50, 100) / 1000
                 time.sleep(rand_time)
                 continue
@@ -330,12 +368,12 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
             batches_sent -= 1
             # add batch at the correct index
             output_superbatch.append({"o": batch_id, "v": batch['value']})
-            print(f"aw-{index}: {video_path} - batch {batch_id} received")
+            logger.info(f"aw-{index}: {video_path} - batch {batch_id} received")
             del batch, batch_id
         # order
         output_superbatch.sort(key=lambda x: x['o'])
         output_superbatch = [x['v'] for x in output_superbatch]
-        print(f"aw-{index}: {video_path} - all batches received")
+        logger.info(f"aw-{index}: {video_path} - all batches received")
 
         video_id = j_metadata['id']
 
@@ -343,7 +381,7 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
         expected_out_shape = (TPU_BATCH_SIZE * superbatch_count, 4, C_H/8, C_W/8)
         assert final_out.shape == expected_out_shape, f"{final_out.shape} != {expected_out_shape}"
         #np.save(f"{SAVE_PATH}/{video_id}.npy", final_out)
-        print(f"aw-{index}: {video_path} - {SAVE_PATH}/{video_id}.npy saved")
+        logger.info(f"aw-{index}: {video_path} - {SAVE_PATH}/{video_id}.npy saved")
 
         if use_wandb:
             wandb_pipe.put(
@@ -366,15 +404,15 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
                 }
             )
 
-            wandb_pipe.put(
-                {
-                    'at': 'sum', 
-                    'c': {
-                        'name': 'aw/hours',
-                        'value': frame_count / v_metadata['video_fps'] / 60 / 60
-                    }
-                }
-            )
+            # wandb_pipe.put(
+            #     {
+            #         'at': 'sum', 
+            #         'c': {
+            #             'name': 'aw/hours',
+            #             'value': frame_count / v_metadata['video_fps'] / 60 / 60
+            #         }
+            #     }
+            # )
 
             wandb_pipe.put(
                 {
@@ -386,9 +424,9 @@ def assign_worker(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_d
                 }
             )
 
-        del output_superbatch, video_id, final_out, v_metadata, j_metadata, frame_count, superbatch_count
+        del output_superbatch, video_id, final_out, j_metadata, frame_count, superbatch_count
         gc_obj += gc.collect()
-        print(f"aw-{index}: {video_path} - done, {gc_obj} objects collected")
+        logger.info(f"aw-{index}: {video_path} - done, {gc_obj} objects collected")
 
 def wandb_worker(wandb_pipe: mp.Queue):
     wandb_run = wandb.init(
@@ -437,21 +475,21 @@ def wandb_worker(wandb_pipe: mp.Queue):
         gc.collect()
 
 def main():
-    print("Initializing...")
-    print(f"Start method is {mp.get_start_method()}")
+    logger.info("Initializing...")
+    logger.info(f"Start method is {mp.get_start_method()}")
     global manager
     manager = mp.Manager()
     file_pipe = manager.Queue(FILE_PIPE_MAX)
     in_data_pipe = manager.Queue(IN_DATA_PIPE_MAX)
     out_data_pipe = manager.Queue(OUT_DATA_PIPE_MAX)
-    print("Objects created")
+    logger.info("Objects created")
     assign_workers = list()
 
     if USE_WANDB:
         wandb_pipe = manager.Queue()
         wandb_worker_process = mp.Process(target=wandb_worker, args=(wandb_pipe,))
         wandb_worker_process.start()
-        print("Wandb worker started")
+        logger.info("Wandb worker started")
     else:
         wandb_pipe = None
 
@@ -459,30 +497,30 @@ def main():
         assign_worker_process = mp.Process(target=assign_worker, args=(i, file_pipe, in_data_pipe, out_data_pipe, wandb_pipe,))
         assign_worker_process.start()
         assign_workers.append(assign_worker_process)
-        print(f"Assign worker {i} started")
+        logger.info(f"Assign worker {i} started")
 
-    print("Assign workers started")
+    logger.info("Assign workers started")
 
     disk_reader_worker = mp.Process(target=disk_reader, args=(file_pipe,))
     disk_reader_worker.start()
-    print("Disk reader started")
+    logger.info("Disk reader started")
 
-    print("starting TPU worker")
+    logger.info("starting TPU worker")
     tpu_worker_process = mp.Process(target=tpu_worker, args=(0, in_data_pipe, out_data_pipe, wandb_pipe,))
     tpu_worker_process.start()
-    print("TPU workers started")
-    print("All workers started, up and running")
+    logger.info("TPU workers started")
+    logger.info("All workers started, up and running")
     
     disk_reader_worker.join()
-    print("Disk reader joined")
+    logger.info("Disk reader joined")
     for i in range(ASSIGN_WORKERS):
         assign_workers[i].join()
-        print(f"Assign worker {i} joined")
+        logger.info(f"Assign worker {i} joined")
     tpu_worker_process.join()
-    print("TPU worker joined")
+    logger.info("TPU worker joined")
     if USE_WANDB:
         wandb_worker_process.join()
-    print("All workers joined, exiting")
+    logger.info("All workers joined, exiting")
 
 if __name__ == "__main__":
     main()
