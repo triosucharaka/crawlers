@@ -24,6 +24,13 @@ SQL_PIPE_MAX = 1000
 
 MAX_BYTES = 1024 * 1024 * 1024 * 1024 # 1TB
 
+def validate_aspect_ratio(aspect_ratio):
+    width, height = map(float, aspect_ratio.split(':'))
+    if height > 1.2 * width or width > 2.0 * height:
+        return False
+    else:
+        return True
+
 # downloader function
 
 def downloader_worker(sql_pipe: mp.Queue, download_count: mp.Value, download_byte_count: mp.Value):
