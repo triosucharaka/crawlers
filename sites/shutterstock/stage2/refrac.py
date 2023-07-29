@@ -8,12 +8,13 @@ import wandb
 import sqlite3
 import tarfile
 import cv2
-import numpy as np
 import time
 import logging
 import tempfile
 import psutil
 # config
+
+#TODO: apply this: https://stackoverflow.com/questions/21485319/high-memory-usage-using-python-multiprocessing max tasks per child, turn funcs into callables or something, just make it so that it restarts
 
 OPERATING_MODE = "process" # process, or thread
 
@@ -37,7 +38,7 @@ FILE_PIPE_MAX = 2000
 WANDB_PIPE_MAX = 1000
 META_PIPE_MAX = 1000
 
-TAR_BYTES = 512 * 1024 * 1024 # 128MB
+TAR_BYTES = 512 * 1024 * 1024 # 512MB
 
 USE_WANDB = True
 WANDB_ENTITY = "tempofunk" # none if not using wandb
