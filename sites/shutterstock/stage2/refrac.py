@@ -20,22 +20,22 @@ SQL_WRITE_PATH = "/home/windowsuser/crawlers/sites/shutterstock/dataset_map.db"
 SQL_MAX = 12500000 # 12.5m
 SQL_WRITE_CHECKPOINT = 2
 
-DOWNLOAD_WORKERS = 2
-DOWNLOAD_TIMEOUT = 15
+DOWNLOAD_WORKERS = 60
+DOWNLOAD_TIMEOUT = 10
 DOWNLOAD_RETRY_COUNT = 3
 
-DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock1/"
-TAR_WORKERS = 2
+DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage2"
+TAR_WORKERS = 5
 
 MAX_VIDEO = 500000
 
 # pipes limits
-SQL_PIPE_MAX = 1000
-FILE_PIPE_MAX = 1000
+SQL_PIPE_MAX = 4000
+FILE_PIPE_MAX = 2000
 WANDB_PIPE_MAX = 1000
 META_PIPE_MAX = 1000
 
-TAR_BYTES = 128 * 1024 * 1024 # 128MB
+TAR_BYTES = 512 * 1024 * 1024 # 128MB
 
 USE_WANDB = True
 WANDB_ENTITY = "tempofunk" # none if not using wandb
@@ -81,35 +81,41 @@ def sql_reader_func(sql_pipe: mp.Queue):
 
     row_count = 0
     while True:
-        #logger.info(f"sql-r: reading: {row_count}")
-        row = cursor.fetchone()
-        if row is None or row_count >= MAX_VIDEO:
-            #logger.info("sql-r: reached max_video")
-            break
+        try:
+            logger.info(f"sql-r: reading: {row_count}")
+            row = cursor.fetchone()
+            if row is None or row_count >= MAX_VIDEO:
+                sql_pipe.put(None)
+                logger.info("sql-r: reached max_video")
+                break
 
-        v_id, desc, dur, asr, v_url, auth, catg, fps, r18 = row 
+            v_id, desc, dur, asr, v_url, auth, catg, fps, r18 = row 
 
-        if not validate_aspect_ratio(asr):
-            #logger.info(f"sql-r: invalid aspect ratio: {v_id}, {asr}")
+            if not validate_aspect_ratio(asr):
+                logger.info(f"sql-r: invalid aspect ratio: {v_id}, {asr}")
+                continue
+
+            metadata = {
+                "id": v_id,
+                "description": desc,
+                "duration": dur,
+                "aspect_ratio": asr,
+                "video_url": v_url,
+                "author": json.loads(auth),
+                "category": json.loads(catg),
+                "fps": fps,
+                "r18": r18
+            }
+
+            sql_pipe.put((v_url, metadata))
+
+            row_count += 1
+
+            logger.info(f"sql-r: sent: {v_id}")
+        except Exception as e:
+            traceback.print_exc()
+            logger.info(f"sql-r: failed: {e}")
             continue
-
-        metadata = {
-            "id": v_id,
-            "description": desc,
-            "duration": dur,
-            "aspect_ratio": asr,
-            "video_url": v_url,
-            "author": json.loads(auth),
-            "category": json.loads(catg),
-            "fps": fps,
-            "r18": r18
-        }
-
-        sql_pipe.put((v_url, metadata))
-
-        row_count += 1
-
-        #logger.info(f"sql-r: sent: {v_id}")
 
     logger.info("sql-r: finished")
 
@@ -118,36 +124,41 @@ def sql_reader_func(sql_pipe: mp.Queue):
 def download_worker_func(index: int, sql_pipe: mp.Queue, file_pipe: mp.Queue):
     logger.info(f"downloader-{index}: started")
     while True:
-        logger.info(f"downloader-{index}: waiting for data")
-        data = sql_pipe.get()
-        logger.info(f"downloader-{index}: got data")
-        
-        if data is None:
-            logger.info(f"downloader-{index}: got None")
-            sql_pipe.put(None)
-            file_pipe.put(None)
-            break
-
-        video_url, metadata = data
-
-        for i in range(DOWNLOAD_RETRY_COUNT):
-            try:
-                response = requests.get(video_url, timeout=DOWNLOAD_TIMEOUT)
-                if response.status_code != 200:
-                    logger.info(f"downloader-{index}: failed: status code: {response.status_code}")
-                    continue
-                logger.info(f"downloader-{index}: downloaded")
+        try:
+            logger.info(f"downloader-{index}: waiting for data")
+            data = sql_pipe.get()
+            logger.info(f"downloader-{index}: got data")
+            
+            if data is None:
+                logger.info(f"downloader-{index}: got None")
+                sql_pipe.put(None)
+                file_pipe.put(None)
                 break
-            except Exception as e:
-                traceback.print_exc()
-                logger.info(f"downloader-{index}: failed: {e}")
+
+            video_url, metadata = data
+
+            for i in range(DOWNLOAD_RETRY_COUNT):
+                try:
+                    response = requests.get(video_url, timeout=DOWNLOAD_TIMEOUT)
+                    if response.status_code != 200:
+                        logger.info(f"downloader-{index}: failed: status code: {response.status_code}")
+                        continue
+                    logger.info(f"downloader-{index}: downloaded")
+                    break
+                except Exception as e:
+                    traceback.print_exc()
+                    logger.info(f"downloader-{index}: failed: {e}")
+                    continue
+            else:
+                logger.info(f"downloader-{index}: failed: max retries")
                 continue
-        else:
-            logger.info(f"downloader-{index}: failed: max retries")
+            
+            file_pipe.put((response.content, metadata))
+            logger.info(f"downloader-{index}: sent")
+        except Exception as e:
+            traceback.print_exc()
+            logger.info(f"downloader-{index}: failed: {e}")
             continue
-        
-        file_pipe.put((response.content, metadata))
-        logger.info(f"downloader-{index}: sent")
 
 def vid_extras(video_bytes: bytes):
     with tempfile.NamedTemporaryFile() as temp:
@@ -168,71 +179,75 @@ def tar_worker_func(index: int, file_pipe: mp.Queue, meta_pipe: mp.Queue, tar_id
     files_size = 0
     logger.info(f"tar-{index}: started")
     while True:
-        logger.info(f"tar-{index}: waiting for data")
-        data = file_pipe.get()
-        logger.info(f"tar-{index}: got data")
-
-        if data is None:
-            logger.info(f"tar-{index}: got None")
-            file_pipe.put(None)
-            meta_pipe.put(None)
-            if USE_WANDB:
-                wandb_pipe.put(None)
-            break
-
-        video_bytes, metadata = data
-        video_id = metadata["id"]
-
-        metadata_as_bytes = json.dumps(metadata).encode("utf-8")
-
-        logger.info(f"tar-{index}: added {video_id} to tar, size: {int(files_size/1024/1024)}/{int(TAR_BYTES/1024/1024)} MB")
-
         try:
-            metadata['cv_height'], metadata['cv_width'], metadata['cv_fps'], metadata['cv_duration'], metadata['cv_frame_count'] = vid_extras(video_bytes)
-        except Exception:
-            logger.info(f"tar-{index}: failed to open video in cv, {video_id}")
-            continue
+            logger.info(f"tar-{index}: waiting for data")
+            data = file_pipe.get()
+            logger.info(f"tar-{index}: got data")
 
-        meta_tar.append(metadata)
-        files_tar.append((video_id, video_bytes, metadata_as_bytes))
-        files_size += len(video_bytes) + len(metadata_as_bytes)
+            if data is None:
+                logger.info(f"tar-{index}: got None")
+                file_pipe.put(None)
+                meta_pipe.put(None)
+                if USE_WANDB:
+                    wandb_pipe.put(None)
+                break
 
-        if USE_WANDB:
-            wandb_pipe.put({"type": "video_entry", "data": (video_id, metadata['cv_fps'], metadata['cv_duration'], metadata['cv_frame_count'])})
+            video_bytes, metadata = data
+            video_id = metadata["id"]
 
-        if files_size > TAR_BYTES:
-            logger.info(f"tar-{index}: tar is full")
-            with tar_id.get_lock():
-                tar_id.value += 1
-                tar_id_copy = tar_id.value
-                
-            tar_id_copy = str(tar_id_copy).zfill(6)
+            metadata_as_bytes = json.dumps(metadata).encode("utf-8")
 
-            logger.info(f"tar-{index}: writing tar to disk")
+            logger.info(f"tar-{index}: added {video_id} to tar, size: {int(files_size/1024/1024)}/{int(TAR_BYTES/1024/1024)} MB")
 
-            # with tarfile.open(name=f"{DISK_PATH}/{tar_id_copy}.tar", mode="w") as tar:
-            #     for video_id, video_bytes, metadata_as_bytes in files_tar:
-            #         tarinfo = tarfile.TarInfo(name=f"{video_id}.mp4")
-            #         tarinfo.size = len(video_bytes)
-            #         tar.addfile(tarinfo, io.BytesIO(video_bytes))
-            #         tarinfo = tarfile.TarInfo(name=f"{video_id}.json")
-            #         tarinfo.size = len(metadata_as_bytes)
-            #         tar.addfile(tarinfo, io.BytesIO(metadata_as_bytes))
-            # Disabled For Testing
+            try:
+                metadata['cv_height'], metadata['cv_width'], metadata['cv_fps'], metadata['cv_duration'], metadata['cv_frame_count'] = vid_extras(video_bytes)
+            except Exception:
+                logger.info(f"tar-{index}: failed to open video in cv, {video_id}")
+                continue
 
-            files_tar = list()
-            files_size = 0
-
-            logger.info(f"tar-{index}: wrote tar to disk")
+            meta_tar.append(metadata)
+            files_tar.append((video_id, video_bytes, metadata_as_bytes))
+            files_size += len(video_bytes) + len(metadata_as_bytes)
 
             if USE_WANDB:
-                wandb_pipe.put({"type": "tar_entry", "data": tar_id_copy})
+                wandb_pipe.put({"type": "video_entry", "data": (video_id, metadata['cv_fps'], metadata['cv_duration'], metadata['cv_frame_count'])})
 
-            meta_pipe.put((tar_id_copy, meta_tar))
+            if files_size > TAR_BYTES:
+                logger.info(f"tar-{index}: tar is full")
+                with tar_id.get_lock():
+                    tar_id.value += 1
+                    tar_id_copy = tar_id.value
+                    
+                tar_id_copy = str(tar_id_copy).zfill(6)
 
-            logger.info(f"tar-{index}: created new tar with id {tar_id_copy}, and {len(meta_tar)} videos")
+                logger.info(f"tar-{index}: writing tar to disk")
 
-            meta_tar = list()
+                with tarfile.open(name=f"{DISK_PATH}/{tar_id_copy}.tar", mode="w") as tar:
+                    for video_id, video_bytes, metadata_as_bytes in files_tar:
+                        tarinfo = tarfile.TarInfo(name=f"{video_id}.mp4")
+                        tarinfo.size = len(video_bytes)
+                        tar.addfile(tarinfo, io.BytesIO(video_bytes))
+                        tarinfo = tarfile.TarInfo(name=f"{video_id}.json")
+                        tarinfo.size = len(metadata_as_bytes)
+                        tar.addfile(tarinfo, io.BytesIO(metadata_as_bytes))
+
+                files_tar = list()
+                files_size = 0
+
+                logger.info(f"tar-{index}: wrote tar to disk")
+
+                if USE_WANDB:
+                    wandb_pipe.put({"type": "tar_entry", "data": tar_id_copy})
+
+                meta_pipe.put((tar_id_copy, meta_tar))
+
+                logger.info(f"tar-{index}: created new tar with id {tar_id_copy}, and {len(meta_tar)} videos")
+
+                meta_tar = list()
+        except Exception as e:
+            traceback.print_exc()
+            logger.info(f"tar-{index}: failed: {e}")
+            continue
 
 def wandb_worker_func(wandb_pipe: mp.Queue):
     run = wandb.init(project=WANDB_PROJ, entity=WANDB_ENTITY)
@@ -244,27 +259,32 @@ def wandb_worker_func(wandb_pipe: mp.Queue):
     tars = 0
 
     while True:
-        data = wandb_pipe.get()
+        try:
+            data = wandb_pipe.get()
 
-        elapsed_time = int(time.time() - init_time)
+            elapsed_time = int(time.time() - init_time)
 
-        if data is None:
-            break
+            if data is None:
+                break
 
-        if data["type"] == "video_entry":
-            video_id, fps, duration, frame_count = data["data"]
-            videos += 1
-            frames += frame_count
-            hours += duration / 3600
-            run.log({"videos": videos, "frames": frames, "hours": hours}, step = elapsed_time)
+            if data["type"] == "video_entry":
+                video_id, fps, duration, frame_count = data["data"]
+                videos += 1
+                frames += frame_count
+                hours += duration / 3600
+                run.log({"videos": videos, "frames": frames, "hours": hours}, step = elapsed_time)
 
-        elif data["type"] == "tar_entry":
-            tars += 1
-            run.log({"tars": tars}, step = elapsed_time)
+            elif data["type"] == "tar_entry":
+                tars += 1
+                run.log({"tars": tars}, step = elapsed_time)
 
-        # speed report
-        if elapsed_time > 0:
-            run.log({"fps": frames / elapsed_time, "vps": videos / elapsed_time, "tps": tars / elapsed_time}, step = elapsed_time)
+            # speed report
+            if elapsed_time > 0:
+                run.log({"fps": frames / elapsed_time, "vps": videos / elapsed_time, "tps": tars / elapsed_time}, step = elapsed_time)
+        except Exception as e:
+            traceback.print_exc()
+            logger.info(f"wandb: failed: {e}")
+            continue
 
     run.finish()
 
@@ -278,39 +298,43 @@ def sql_writer_func(meta_pipe: mp.Queue):
     logger.info("sql_writer: started")
 
     while True:
-        data = meta_pipe.get()
+        try:
+            data = meta_pipe.get()
 
-        if data is None:
-            meta_pipe.put(None)
-            break
+            if data is None:
+                break
 
-        tar_id, meta_batch = data
+            tar_id, meta_batch = data
 
-        for video_entry in meta_batch:
-            item = video_entry
-            cursor.execute("INSERT OR REPLACE INTO dataset_map (id, tar_id, cv_height, cv_width, cv_fps, cv_duration, cv_frame_count, aspect_ratio, video_url, description, author, category, r18) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                           (
-                            item['id'], 
-                            tar_id, 
-                            item['cv_height'], 
-                            item['cv_width'], 
-                            item['cv_fps'],
-                            item['cv_duration'],
-                            item['cv_frame_count'],
-                            item['aspect_ratio'],
-                            item['video_url'],
-                            item['description'],
-                            json.dumps(item['author']),
-                            json.dumps(item['category']),
-                            item['r18']
-                           )
-                         )
-        itteration += 1
-        logger.info(f"sql_writer: wrote {len(meta_batch)} entries")
+            for video_entry in meta_batch:
+                item = video_entry
+                cursor.execute("INSERT OR REPLACE INTO dataset_map (id, tar_id, cv_height, cv_width, cv_fps, cv_duration, cv_frame_count, aspect_ratio, video_url, description, author, category, r18) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                item['id'], 
+                                tar_id, 
+                                item['cv_height'], 
+                                item['cv_width'], 
+                                item['cv_fps'],
+                                item['cv_duration'],
+                                item['cv_frame_count'],
+                                item['aspect_ratio'],
+                                item['video_url'],
+                                item['description'],
+                                json.dumps(item['author']),
+                                json.dumps(item['category']),
+                                item['r18']
+                            )
+                            )
+            itteration += 1
+            logger.info(f"sql_writer: wrote {len(meta_batch)} entries")
 
-        if itteration % SQL_WRITE_CHECKPOINT == 0:
-            conn.commit()
-            logger.info("sql_writer: checkpoint")
+            if itteration % SQL_WRITE_CHECKPOINT == 0:
+                conn.commit()
+                logger.info("sql_writer: checkpoint")
+        except Exception as e:
+            traceback.print_exc()
+            logger.info(f"sql_writer: failed: {e}")
+            continue
 
     conn.commit()
     conn.close()
@@ -327,23 +351,36 @@ def main():
         wandb_pipe = None
     tar_id = mp.Value("i", 0)
 
+    logger.info("starting threads")
+
     sql_reader = Thread(target=sql_reader_func, args=(sql_pipe,))
     sql_reader.start()
+
+    logger.info("started sql_reader")
 
     download_threads = [Thread(target=download_worker_func, args=(i, sql_pipe, file_pipe,)) for i in range(DOWNLOAD_WORKERS)]
     for thread in download_threads:
         thread.start()
 
+    logger.info("started download_workers")
+
     tar_threads = [Thread(target=tar_worker_func, args=(i, file_pipe, meta_pipe, tar_id, wandb_pipe,)) for i in range(TAR_WORKERS)]
     for thread in tar_threads:
         thread.start()
+
+    logger.info("started tar_workers")
 
     if USE_WANDB:
         wandb_thread = Thread(target=wandb_worker_func, args=(wandb_pipe,))
         wandb_thread.start()
 
+    logger.info("started wandb_worker")
+
     sql_writer = Thread(target=sql_writer_func, args=(meta_pipe,))
     sql_writer.start()
+
+    logger.info("started sql_writer")
+    logger.info("main: ready and waiting till full join")
 
     sql_reader.join()
     for thread in download_threads:
@@ -353,6 +390,8 @@ def main():
     if USE_WANDB:
         wandb_thread.join()
     sql_writer.join()
+
+    logger.info("main: finished")
 
 if __name__ == "__main__":
     main()
