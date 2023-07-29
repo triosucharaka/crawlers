@@ -15,6 +15,8 @@ import tempfile
 import psutil
 # config
 
+OPERATING_MODE = "process" # process, or thread
+
 SQL_READ_PATH = "/home/windowsuser/crawlers/sites/shutterstock/database.db"
 SQL_WRITE_PATH = "/home/windowsuser/crawlers/sites/shutterstock/dataset_map.db"
 SQL_MAX = 12500000 # 12.5m
@@ -340,6 +342,12 @@ def sql_writer_func(meta_pipe: mp.Queue):
     conn.close()
 
 def main():
+
+    if OPERATING_MODE == "process":
+        spawner = mp.Process
+    elif OPERATING_MODE == "thread":
+        spawner = Thread
+
     manager = mp.Manager()
 
     sql_pipe = manager.Queue(maxsize=SQL_PIPE_MAX)
@@ -353,30 +361,30 @@ def main():
 
     logger.info("starting threads")
 
-    sql_reader = Thread(target=sql_reader_func, args=(sql_pipe,))
+    sql_reader = spawner(target=sql_reader_func, args=(sql_pipe,))
     sql_reader.start()
 
     logger.info("started sql_reader")
 
-    download_threads = [Thread(target=download_worker_func, args=(i, sql_pipe, file_pipe,)) for i in range(DOWNLOAD_WORKERS)]
+    download_threads = [spawner(target=download_worker_func, args=(i, sql_pipe, file_pipe,)) for i in range(DOWNLOAD_WORKERS)]
     for thread in download_threads:
         thread.start()
 
     logger.info("started download_workers")
 
-    tar_threads = [Thread(target=tar_worker_func, args=(i, file_pipe, meta_pipe, tar_id, wandb_pipe,)) for i in range(TAR_WORKERS)]
+    tar_threads = [spawner(target=tar_worker_func, args=(i, file_pipe, meta_pipe, tar_id, wandb_pipe,)) for i in range(TAR_WORKERS)]
     for thread in tar_threads:
         thread.start()
 
     logger.info("started tar_workers")
 
     if USE_WANDB:
-        wandb_thread = Thread(target=wandb_worker_func, args=(wandb_pipe,))
+        wandb_thread = spawner(target=wandb_worker_func, args=(wandb_pipe,))
         wandb_thread.start()
 
     logger.info("started wandb_worker")
 
-    sql_writer = Thread(target=sql_writer_func, args=(meta_pipe,))
+    sql_writer = spawner(target=sql_writer_func, args=(meta_pipe,))
     sql_writer.start()
 
     logger.info("started sql_writer")
