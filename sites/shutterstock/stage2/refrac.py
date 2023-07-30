@@ -198,8 +198,6 @@ def tar_worker_func(index: int, file_pipe: mp.Queue, meta_pipe: mp.Queue, tar_id
             video_bytes, metadata = data
             video_id = metadata["id"]
 
-            metadata_as_bytes = json.dumps(metadata).encode("utf-8")
-
             logger.info(f"tar-{index}: added {video_id} to tar, size: {int(files_size/1024/1024)}/{int(TAR_BYTES/1024/1024)} MB")
 
             try:
@@ -207,6 +205,10 @@ def tar_worker_func(index: int, file_pipe: mp.Queue, meta_pipe: mp.Queue, tar_id
             except Exception:
                 logger.info(f"tar-{index}: failed to open video in cv, {video_id}")
                 continue
+
+            # NOTE: before 29/7/2023, the cv metadata was not included in the JSONs.
+            # this include the 500k dataset.
+            metadata_as_bytes = json.dumps(metadata).encode("utf-8")
 
             meta_tar.append(metadata)
             files_tar.append((video_id, video_bytes, metadata_as_bytes))
