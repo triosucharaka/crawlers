@@ -33,9 +33,9 @@ TMP_PTH = "/home/windowsuser/crawlers/sites/shutterstock/stage3/tmp"
 global USE_WANDB
 
 USE_WANDB = True
-WANDB_ENTITY = "tempofunk" # none if not using wandb
-WANDB_PROJ = "shutterstock_stage3"
-WANDB_NAME = f"TPUV4_64BS_NOLOG_QUAD_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
+WANDB_ENTITY = "peruano" # none if not using wandb
+WANDB_PROJ = "debug_shutterstock_stage3"
+WANDB_NAME = f"DEBUG_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
 WANDB_ONLY_ONE_CORE = True
 TAR_SIZE = 128 * 1024 * 1024 # 512MB
 
@@ -50,8 +50,8 @@ IM2IM_MODEL_PATH = "im2im-sswm"
 
 ## Pipes
 FILE_PIPE_MAX = 200
-IN_DATA_PIPE_MAX = 400
-OUT_DATA_PIPE_MAX = 400
+IN_DATA_PIPE_MAX = 200
+OUT_DATA_PIPE_MAX = 200
 TAR_PIPE_MAX = 200
 WANDB_PIPE_MAX = 1000
 
@@ -59,33 +59,33 @@ C_C = 3
 C_H = 384 # (divisible by 64)
 C_W = 640 # (divisible by 64)
 
-# LOG_MEMORY = True
+LOG_MEMORY = True
 
-# def get_memory():
-#     mem_info = psutil.virtual_memory()
-#     free_memory = f"SMU: {round(mem_info.used / 1024 ** 2, 2)}MB; {mem_info.percent}" 
-#     return free_memory
+def get_memory():
+    mem_info = psutil.virtual_memory()
+    free_memory = f"SMU: {round(mem_info.used / 1024 ** 2, 2)}MB; {mem_info.percent}" 
+    return free_memory
 
-# class CustomLogger(logging.LoggerAdapter):
-#     def process(self, msg, kwargs):
-#         return f'{get_memory()} - {msg}', kwargs
+class CustomLogger(logging.LoggerAdapter):
+    def process(self, msg, kwargs):
+        return f'{get_memory()} - {msg}', kwargs
 
-# logger = logging.getLogger(__name__)
-# c_handler = logging.StreamHandler()
-# f_handler = logging.FileHandler('file.log')
-# c_format = logging.Formatter(f'%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-# f_format = logging.Formatter(f'%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-# c_handler.setFormatter(c_format)
-# f_handler.setFormatter(f_format)
-# logger.addHandler(c_handler)
-# logger.addHandler(f_handler)
-# logger.setLevel(logging.DEBUG)
+logger = logging.getLogger(__name__)
+c_handler = logging.StreamHandler()
+f_handler = logging.FileHandler('file.log')
+c_format = logging.Formatter(f'%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+f_format = logging.Formatter(f'%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+c_handler.setFormatter(c_format)
+f_handler.setFormatter(f_format)
+logger.addHandler(c_handler)
+logger.addHandler(f_handler)
+logger.setLevel(logging.DEBUG)
 
-# if LOG_MEMORY:
-#     logger = CustomLogger(logger, {})
+if LOG_MEMORY:
+    logger = CustomLogger(logger, {})
 
 def wds_reader_func(file_pipe: mp.Queue):
-    #logger.info("wds-r: started")
+    logger.info("wds-r: started")
 
     json_map = json.load(open(JSON_MAP_PATH, "r"))
     tar_map = list()
@@ -96,7 +96,7 @@ def wds_reader_func(file_pipe: mp.Queue):
     dataset = wds.WebDataset(tar_map)
 
     for sample in dataset:
-        #logger.info(f"wds-r: sending {sample['__key__']}")
+        logger.info(f"wds-r: sending {sample['__key__']}")
         file_pipe.put((
             sample["__key__"],
             sample["mp4"],
@@ -105,15 +105,14 @@ def wds_reader_func(file_pipe: mp.Queue):
 
     file_pipe.put((None, None, None))
 
-    #logger.info("wds-r: finished")
+    logger.info("wds-r: finished")
 
 def tpu_worker_func(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, tmp_c: mp.Value):
-    print(f'tw-{index}: started, grabbing device {index}')
-    #logger.info(f'tw-{index}: started, grabbing device {index}')
+    logger.info(f'tw-{index}: started, grabbing device {index}')
     device = xm.xla_device()
-    #logger.info(f'tw-{index}: device {index} successfully grabbed')
+    logger.info(f'tw-{index}: device {index} successfully grabbed')
     model = load_model(IM2IM_MODEL_PATH, device)
-    #logger.info(f'tw-{index}: model loaded')
+    logger.info(f'tw-{index}: model loaded')
 
     with tmp_c.get_lock():
         tmp_c.value += 1
@@ -142,7 +141,7 @@ def tpu_worker_func(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, tmp_
 
     def put_batch_func(batch, data):
         try:
-            #print(f'tw-{index}: putting batch')
+            print(f'tw-{index}: putting batch')
             cpu_batch = batch.to(device = 'cpu', dtype = torch.uint8).numpy() # numpy, uint8, 0-255
             out_data_pipe.put({
                 'value': cpu_batch, 
@@ -152,7 +151,7 @@ def tpu_worker_func(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, tmp_
                     }
                 }
             )
-            #print(f'tw-{index}: batch put')
+            print(f'tw-{index}: batch put')
         except Exception as e:
             print(f'tw-{index}: batch put failed: {e}')
             traceback.print_exc()
@@ -163,51 +162,50 @@ def tpu_worker_func(index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, tmp_
         task_thead.start()
         tasks.append(task_thead)
 
-    #logger.info(f'tw-{index}: init signal received')
+    logger.info(f'tw-{index}: init signal received')
     first_run = True # first run is always compilation 
     while True:
         gc_obj = 0
-        #logger.info(f'tw-{index}: waiting for data')
+        logger.info(f'tw-{index}: waiting for data')
         data = in_data_pipe.get() # (B, H, W, C)
         if data is None:
             break
-        #if first_run:
-            #logger.info(f'tw-{index}: first run, is always compilation')
-        #logger.info(f'tw-{index}: data received')
+        if first_run:
+            logger.info(f'tw-{index}: first run, is always compilation')
+        logger.info(f'tw-{index}: data received')
 
         init_time = time.time()
         value = torch.from_numpy(data['value'])
         value, _h, _w = prep_batch(value)
-        #logger.info(f'tw-{index}: data prep in {time.time() - init_time} seconds')
+        logger.info(f'tw-{index}: data prep in {time.time() - init_time} seconds')
         batch = model(value)
-        #logger.info(f'tw-{index}: model run in {time.time() - init_time} seconds')
+        logger.info(f'tw-{index}: model run in {time.time() - init_time} seconds')
         batch = post_batch(batch, _h, _w)
-        #logger.info(f'tw-{index}: data post in {time.time() - init_time} seconds')
+        logger.info(f'tw-{index}: data post in {time.time() - init_time} seconds')
         finish_time = time.time()
 
         if first_run:
             first_run = False
-            #logger.info(f'tw-{index}: compilation done in {finish_time - init_time} seconds, out shape {batch.shape}')
-        #else:
-            #logger.info(f'tw-{index}: data processed in {finish_time - init_time} seconds, out shape {batch.shape}')
+            logger.info(f'tw-{index}: compilation done in {finish_time - init_time} seconds, out shape {batch.shape}')
+        else:
+            logger.info(f'tw-{index}: data processed in {finish_time - init_time} seconds, out shape {batch.shape}')
 
-        #logger.info(f'tw-{index}: triggering put_batch')
+        logger.info(f'tw-{index}: triggering put_batch')
         put_batch(batch, data)
-        #logger.info(f'tw-{index}: put_batch triggered')
+        logger.info(f'tw-{index}: put_batch triggered')
 
         del value, batch, data, init_time, finish_time, _h, _w
         gc_obj += gc.collect()
-        #logger.info(f'tw-{index}: data processed, {gc_obj} objects collected, {len(tasks)} tasks in queue')
-        #logger.info(f'tw-{index}: in queue size: {in_data_pipe.qsize()}, out queue size: {out_data_pipe.qsize()}')
+        logger.info(f'tw-{index}: data processed, {gc_obj} objects collected, {len(tasks)} tasks in queue')
+        logger.info(f'tw-{index}: in queue size: {in_data_pipe.qsize()}, out queue size: {out_data_pipe.qsize()}')
 
     for task in tasks:
         task.join()
 
-    #logger.info(f'tw-{index}: finished')
+    logger.info(f'tw-{index}: finished')
 
 def assign_worker_func(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, tar_pipe: mp.Queue):
-    #logger.info(f"aw-{index}: started")
-    print(f"aw-{index}: started")
+    logger.info(f"aw-{index}: started")
 
     tasks = []
 
@@ -219,7 +217,7 @@ def assign_worker_func(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, 
                 bgr_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 out.write(bgr_frame)
                 written_frames += 1
-            #logger.info(f"aw-{index}: {vid_id} - {written_frames} frames written")
+            logger.info(f"aw-{index}: {vid_id} - {written_frames} frames written")
             out_frame_count = int(written_frames)
             out_height = int(final_out.shape[1])
             out_width = int(final_out.shape[2])
@@ -240,13 +238,13 @@ def assign_worker_func(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, 
 
             with open(temp.name, 'rb') as f:
                 final_out = f.read() # mp4 out bytes
-        #logger.info(f"aw-{index}: {vid_id} - video written, {len(final_out)/1024/1024} MB")
+        logger.info(f"aw-{index}: {vid_id} - video written, {len(final_out)/1024/1024} MB")
 
         metadata_bytes = json.dumps(metadata).encode('utf-8') # json metadata bytes
 
-        #logger.info(f"avail meta: {metadata}")
+        logger.info(f"avail meta: {metadata}")
         tar_pipe.put((vid_id, final_out, metadata_bytes, metadata)) # str, bytes, bytes
-        #logger.info(f"aw-{index}: {vid_id} - sent to tar worker")
+        logger.info(f"aw-{index}: {vid_id} - sent to tar worker")
 
     def save_video(fps, final_out, metadata, vid_id):
         task_thead = threading.Thread(target = save_video_func, args = (fps, final_out, metadata, vid_id))
@@ -256,12 +254,12 @@ def assign_worker_func(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, 
     while True:
         gc_obj = 0
 
-        #logger.info(f"aw-{index}: {index} waiting for file")
+        logger.info(f"aw-{index}: {index} waiting for file")
         vid_id, mp4_bytes, metadata = file_pipe.get()
-        #logger.info(f"aw-{index}: {vid_id} received")
+        logger.info(f"aw-{index}: {vid_id} received")
 
         if vid_id is None and mp4_bytes is None and metadata is None:
-            #logger.info(f"aw-{index}: termination signal received")
+            logger.info(f"aw-{index}: termination signal received")
             for i in range(TPU_CORE_COUNT):
                 in_data_pipe.put(None, timeout=1)
                 tar_pipe.put((None, None, None, None), timeout=1)
@@ -269,16 +267,20 @@ def assign_worker_func(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, 
 
         metadata = json.loads(metadata.decode("utf-8"))
 
+        if float(metadata['duration']) > 10*60:
+            logger.info(f"aw-{index}: {vid_id} - {metadata['duration']} > 10*60, during prediction, skipping")
+            continue
+
         predicted_frame_count = int(float(metadata['fps']) * float(metadata['duration']))
         predicted_superbatch_count = predicted_frame_count // TPU_BATCH_SIZE
         if predicted_superbatch_count > MAX_SUPERBATCHES:
             predicted_superbatch_count = MAX_SUPERBATCHES
         predicted_superbatch_count = predicted_superbatch_count // TPU_CORE_COUNT
         if predicted_superbatch_count  < 1:
-            #logger.info(f"aw-{index}: {vid_id} - {predicted_superbatch_count} < 1, during prediction, skipping")
+            logger.info(f"aw-{index}: {vid_id} - {predicted_superbatch_count} < 1, during prediction, skipping")
             continue
 
-        #logger.info(f"aw-{index}: {vid_id} loading video")
+        logger.info(f"aw-{index}: {vid_id} loading video")
         with tempfile.NamedTemporaryFile() as temp:
             temp.write(mp4_bytes)
             temp.flush()
@@ -286,7 +288,7 @@ def assign_worker_func(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, 
 
             resized_frames = []
 
-            #logger.info(f"aw-{index}: {vid_id} resizing video")
+            logger.info(f"aw-{index}: {vid_id} resizing video")
             while True:
                 ret, frame = video_cap.read()
                 if not ret:
@@ -297,7 +299,7 @@ def assign_worker_func(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, 
                 )
                 numpy_frame = np.array(resized_frame)
                 resized_frames.append(numpy_frame)
-            #logger.info(f"aw-{index}: {vid_id} video resized")
+            logger.info(f"aw-{index}: {vid_id} video resized")
 
             frames = np.array(resized_frames) # (T, H, W, C)
             frame_count = frames.shape[0]
@@ -305,10 +307,10 @@ def assign_worker_func(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, 
 
             del video_cap, resized_frames, resized_frame, numpy_frame, frame, mp4_bytes
 
-        #logger.info(f"aw-{index}: {vid_id} video loaded")
+        logger.info(f"aw-{index}: {vid_id} video loaded")
 
         if frame_count < TPU_BATCH_SIZE:
-            #logger.info(f"aw-{index}: {vid_id} - {frame_count} < {TPU_BATCH_SIZE}, skipping")
+            logger.info(f"aw-{index}: {vid_id} - {frame_count} < {TPU_BATCH_SIZE}, skipping")
             continue
 
         # batch = (f, f, f, f, .. 16 times) # 16 frames
@@ -320,14 +322,14 @@ def assign_worker_func(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, 
             superbatch_count = MAX_SUPERBATCHES
         superbatch_count = superbatch_count // TPU_CORE_COUNT # to fit exactly
         if superbatch_count < 1:
-            #logger.info(f"aw-{index}: {vid_id} - {superbatch_count} < 1, skipping")
+            logger.info(f"aw-{index}: {vid_id} - {superbatch_count} < 1, skipping")
             continue
         superbatch_count = superbatch_count * TPU_CORE_COUNT
-        #logger.info(f"aw-{index}: {vid_id} - using {superbatch_count * TPU_BATCH_SIZE}/{frame_count} frames, {superbatch_count} megabatches")
+        logger.info(f"aw-{index}: {vid_id} - using {superbatch_count * TPU_BATCH_SIZE}/{frame_count} frames, {superbatch_count} megabatches")
 
         batches_sent = 0
 
-        #logger.info(f"aw-{index}: {vid_id} - sending batches to TPU workers")
+        logger.info(f"aw-{index}: {vid_id} - sending batches to TPU workers")
         for i in range(superbatch_count):
             batch = frames[range(i * TPU_BATCH_SIZE, (i + 1) * TPU_BATCH_SIZE)]
             assert batch.shape[3] == C_C
@@ -339,10 +341,10 @@ def assign_worker_func(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, 
             in_data_pipe.put(batch) 
             # I EXPECT (B, H, W, C) AKA (16, 256, 256, 3)!!!!
             # batch should be a numpy array, uint8, 0-255, (B, H, W, C)
-            #logger.info(f"aw-{index}: {vid_id} - batch {i} sent with sahpe {batch['value'].shape}")
+            logger.info(f"aw-{index}: {vid_id} - batch {i} sent with sahpe {batch['value'].shape}")
             batches_sent += 1
             del batch
-        #logger.info(f"aw-{index}: {vid_id} - bastches sent to TPU workers")
+        logger.info(f"aw-{index}: {vid_id} - bastches sent to TPU workers")
 
         del frames
         gc_obj += gc.collect()
@@ -357,82 +359,41 @@ def assign_worker_func(index: int, file_pipe: mp.Queue, in_data_pipe: mp.Queue, 
             batches_sent -= 1
             # add batch at the correct index
             output_superbatch.append({"o": batch_id, "v": batch['value']})
-            #logger.info(f"aw-{index}: {vid_id} - batch {batch_id} received")
+            logger.info(f"aw-{index}: {vid_id} - batch {batch_id} received")
             del batch, batch_id
         # order
         output_superbatch.sort(key=lambda x: x['o'])
         output_superbatch = [x['v'] for x in output_superbatch]
-        #logger.info(f"aw-{index}: {vid_id} - all batches received")
+        logger.info(f"aw-{index}: {vid_id} - all batches received")
         final_out = np.concatenate(output_superbatch, axis=0)
-        #logger.info(f"aw-{index}: {vid_id} - final output shape {final_out.shape}, writing video...")
+        logger.info(f"aw-{index}: {vid_id} - final output shape {final_out.shape}, writing video...")
 
         save_video(fps, final_out, metadata, vid_id)
 
-        #logger.info(f"aw-{index}: {vid_id} - called save_video")
-
-        # with tempfile.NamedTemporaryFile(suffix='.mp4') as temp:
-        #     out = cv2.VideoWriter(temp.name, cv2.VideoWriter_fourcc(*'mp4v'), fps, (C_W, C_H))
-        #     written_frames = 0
-        #     for frame in final_out:
-        #         bgr_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        #         out.write(bgr_frame)
-        #         written_frames += 1
-        #     logger.info(f"aw-{index}: {vid_id} - {written_frames} frames written")
-        #     out_frame_count = int(written_frames)
-        #     out_height = int(final_out.shape[1])
-        #     out_width = int(final_out.shape[2])
-        #     out_fps = fps
-        #     out_duration = out_frame_count / out_fps
-
-        #     swap_meta = {
-        #         'cv_frame_count': out_frame_count,
-        #         'cv_height': out_height,
-        #         'cv_width': out_width,
-        #         'cv_fps': out_fps,
-        #         'cv_duration': out_duration,
-        #     }
-
-        #     metadata = {**metadata, **swap_meta}
-        #     out.release()
-        #     temp.flush()
-
-        #     with open(temp.name, 'rb') as f:
-        #         final_out = f.read() # mp4 out bytes
-        # logger.info(f"aw-{index}: {vid_id} - video written, {len(final_out)/1024/1024} MB")
-
-        # metadata_bytes = json.dumps(metadata).encode('utf-8') # json metadata bytes
-
-        # del output_superbatch, out, out_frame_count, out_height, out_width, out_fps, out_duration, swap_meta
-
-        # logger.info(f"avail meta: {metadata} ")
-        # tar_pipe.put((vid_id, final_out, metadata_bytes, metadata)) # str, bytes, bytes
-        # logger.info(f"aw-{index}: {vid_id} - sent to tar worker")
-
-        # del final_out, metadata, metadata_bytes
+        logger.info(f"aw-{index}: {vid_id} - called save_video")
 
         gc_obj += gc.collect()
-        #print(f"aw-{index}: {vid_id} - done, {gc_obj} objects collected")
+        print(f"aw-{index}: {vid_id} - done, {gc_obj} objects collected")
 
         del vid_id
 
     for task in tasks:
         task.join()
-    #logger.info(f"aw-{index}: exiting")
+    logger.info(f"aw-{index}: exiting")
 
 def tar_worker_func(index: int, tar_pipe: mp.Queue, wandb_pipe: mp.Queue, tar_id: mp.Value):
-    print(f"tar {index} started")
     files_tar = list()
     files_size = 0
 
-    #logger.info(f"tar-{index}: started")
+    logger.info(f"tar-{index}: started")
 
     while True:
-        #logger.info(f"tar-{index}: waiting for data")
+        logger.info(f"tar-{index}: waiting for data")
         vid_id, vid_bytes, meta_bytes, meta = tar_pipe.get()
-        #logger.info(f"tar-{index}: got data")
+        logger.info(f"tar-{index}: got data")
 
         if all(x is None for x in [vid_id, vid_bytes, meta_bytes, meta]):
-            #logger.info(f"tar-{index}: got None, exiting")
+            logger.info(f"tar-{index}: got None, exiting")
             if USE_WANDB:
                 wandb_pipe.put(None)
             break
@@ -442,13 +403,13 @@ def tar_worker_func(index: int, tar_pipe: mp.Queue, wandb_pipe: mp.Queue, tar_id
         if USE_WANDB:
             wandb_pipe.put({"type": "video_entry", "data": (vid_id, meta['cv_fps'], meta['cv_duration'], meta['cv_frame_count'])})
 
-        #logger.info(f"tar-{index}: {vid_id} - added to tar, size {files_size/1024/1024} MB")
+        logger.info(f"tar-{index}: {vid_id} - added to tar, size {files_size/1024/1024} MB")
 
         if files_size > TAR_SIZE:
             with tar_id.get_lock():
                 tar_id.value += 1
                 tar_id_val = tar_id.value
-            #logger.info(f"tar-{index}: {tar_id_val} - tar size exceeded, writing to disk")
+            logger.info(f"tar-{index}: {tar_id_val} - tar size exceeded, writing to disk")
 
             tar_id_val = str(tar_id_val).zfill(6)
 
@@ -466,7 +427,7 @@ def tar_worker_func(index: int, tar_pipe: mp.Queue, wandb_pipe: mp.Queue, tar_id
             files_tar = list()
             files_size = 0
 
-            #logger.info(f"tar-{index}: {tar_id_val} - tar written to disk")
+            logger.info(f"tar-{index}: {tar_id_val} - tar written to disk")
 
             if USE_WANDB:
                 wandb_pipe.put({"type": "tar_entry", "data": None})
@@ -485,7 +446,7 @@ def wandb_worker_func(wandb_pipe: mp.Queue, tmp_c: mp.Value, file_pipe: mp.Queue
     tars = 0
 
     while True:
-        #logger.info(f"total tpus: {int(tmp_c.value)}")
+        logger.info(f"total tpus: {int(tmp_c.value)}")
 
         data = wandb_pipe.get()
 
@@ -503,11 +464,11 @@ def wandb_worker_func(wandb_pipe: mp.Queue, tmp_c: mp.Value, file_pipe: mp.Queue
 
         if data["type"] == "video_entry":
             video_id, fps, duration, frame_count = data["data"]
-            #logger.info(f"fabella vid_id: {video_id}, fps: {fps}, duration: {duration}, frame_count: {frame_count}")
+            logger.info(f"fabella vid_id: {video_id}, fps: {fps}, duration: {duration}, frame_count: {frame_count}")
             videos += 1
             frames += frame_count
             hours += duration / 3600
-            #logger.info(f"fabella to send: {videos}, {frames}, {hours}")
+            logger.info(f"fabella to send: {videos}, {frames}, {hours}")
             run.log({"videos": videos, "frames": frames, "hours": hours}, step = elapsed_time)
 
         elif data["type"] == "tar_entry":
@@ -531,8 +492,7 @@ def out_pipe_manager(main_out_pipe: mp.Queue, secondary_out_pipes: list):
         secondary_out_pipes[worker_id].put(data)
 
 if __name__ == "__main__":
-    print("main started")
-    #logger.info("main: started")
+    logger.info("main: started")
 
     manager = mp.Manager()
 
@@ -588,24 +548,24 @@ if __name__ == "__main__":
 
     xmp.spawn(tpu_worker_func, args=(in_data_pipe, tpu_out_data_pipe, tmp_c,), nprocs=TPU_CORE_COUNT)
 
-    #logger.info("main: waiting for workers to finish")
+    logger.info("main: waiting for workers to finish")
     wds_worker_process.join()
-    #logger.info("main: wds_worker_process finished")
+    logger.info("main: wds_worker_process finished")
     pipe_manager_process.join()
-    #logger.info("main: pipe_manager_process finished")
+    logger.info("main: pipe_manager_process finished")
     # for tpu_worker_process in tpu_worker_processes:
     #     tpu_worker_process.join()
     for assign_worker_process in assign_worker_processes:
         assign_worker_process.join()
-        #logger.info("main: SOME assign_worker_process finished")
-    #logger.info("main: assign_worker_processes finished")
+        logger.info("main: SOME assign_worker_process finished")
+    logger.info("main: assign_worker_processes finished")
     for tar_worker_process in tar_worker_processes:
         tar_worker_process.join()
-        #logger.info("main: SOME tar_worker_process finished")
-    #logger.info("main: tar_worker_processes finished")
+        logger.info("main: SOME tar_worker_process finished")
+    logger.info("main: tar_worker_processes finished")
 
     if USE_WANDB:
         wandb_pipe.put(None)
         wandb_worker_process.join()
 
-    #logger.info("main: finished")
+    logger.info("main: finished")
