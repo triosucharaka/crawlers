@@ -64,6 +64,10 @@ WANDB_PIPE_MAX = 1000
 
 ### End Configuration ###
 
+assert C_C == 3, "C_C must be 3, for RGB"
+assert C_H % 64 == 0, "C_H must be divisible by 64"
+assert C_W % 64 == 0, "C_W must be divisible by 64"
+
 
 def get_memory():
     mem_info = psutil.virtual_memory()
@@ -586,7 +590,36 @@ def wandb_worker_func(
     o_dp: mp.Queue,
     t_p: mp.Queue,
 ):
-    run = wandb.init(project=WANDB_PROJ, entity=WANDB_ENTITY, name=WANDB_NAME)
+    
+    run_config = {
+        "IN_DISK_PATH": IN_DISK_PATH,
+        "OUT_DISK_PATH": OUT_DISK_PATH,
+        "JSON_MAP_PATH": JSON_MAP_PATH,
+        "LOG_MEMORY": LOG_MEMORY,
+        "ASSIGN_WORKER_COUNT": ASSIGN_WORKER_COUNT,
+        "ASSIGN_WORKER_MAX_TASKS_PER_CHILD": ASSIGN_WORKER_MAX_TASKS_PER_CHILD,
+        "TAR_WORKER_COUNT": TAR_WORKER_COUNT,
+        "TAR_SIZE": TAR_SIZE,
+        "TPU_CORE_COUNT": TPU_CORE_COUNT,
+        "TPU_BATCH_SIZE": TPU_BATCH_SIZE,
+        "MAX_SUPERBATCHES": MAX_SUPERBATCHES,
+        "IM2IM_MODEL_PATH": IM2IM_MODEL_PATH,
+        "C_C": C_C,
+        "C_H": C_H,
+        "C_W": C_W,
+        "FILE_PIPE_MAX": FILE_PIPE_MAX,
+        "IN_DATA_PIPE_MAX": IN_DATA_PIPE_MAX,
+        "OUT_DATA_PIPE_MAX": OUT_DATA_PIPE_MAX,
+        "TAR_PIPE_MAX": TAR_PIPE_MAX,
+        "WANDB_PROJ": WANDB_PROJ,
+    }
+
+    run = wandb.init(
+        project=WANDB_PROJ, 
+        entity=WANDB_ENTITY, 
+        name=WANDB_NAME,
+        config=run_config,)
+    
     init_time = time.time()
 
     frames = 0
