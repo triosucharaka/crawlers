@@ -79,15 +79,10 @@ class CustomLogger(logging.LoggerAdapter):
     def process(self, msg, kwargs):
         return f"{get_memory()} - {msg}", kwargs
 
-
 logger = logging.getLogger(__name__)
-c_handler = logging.StreamHandler()
 f_handler = logging.FileHandler("file.log")
-c_format = logging.Formatter(f"%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 f_format = logging.Formatter(f"%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-c_handler.setFormatter(c_format)
 f_handler.setFormatter(f_format)
-logger.addHandler(c_handler)
 logger.addHandler(f_handler)
 logger.setLevel(logging.DEBUG)
 
@@ -161,7 +156,7 @@ def tpu_worker_func(
 
     def put_batch_func(batch, data):
         try:
-            print(f"TPU-{index}/ASYNC: placing batch")
+            logger.info(f"TPU-{index}/ASYNC: placing batch")
             cpu_batch = batch.to(
                 device="cpu", dtype=torch.uint8
             ).numpy()  # numpy, uint8, 0-255
@@ -174,11 +169,10 @@ def tpu_worker_func(
                     },
                 }
             )
-            print(f"TPU-{index}/ASYNC: batch on out_data_pipe")
+            logger.info(f"TPU-{index}/ASYNC: batch on out_data_pipe")
         except Exception as e:
-            print(f"TPU-{index}/ASYNC: batch place failed: {e}")
-            traceback.print_exc()
-            print(e)
+            logger.error(f"TPU-{index}/ASYNC: batch place failed: {e}")
+            logger.error(traceback.format_exc())
 
     def put_batch(batch, data):
         task_thead = threading.Thread(target=put_batch_func, args=(batch, data))
@@ -201,21 +195,21 @@ def tpu_worker_func(
             init_time = time.time()
             value = torch.from_numpy(data["value"]) # (B, H, W, C), torch tensor, uint8, 0-255
             value, _h, _w = prep_batch(value) # (B, C, H, W), torch tensor, float32, 0-1
-            logger.info(f"TPU-{index}: data prep in {time.time() - init_time} seconds")
+            logger.info(f"TPU-{index}: data prep in {round(time.time() - init_time, 4)} seconds")
             batch = model(value)
-            logger.info(f"TPU-{index}: model run in {time.time() - init_time} seconds")
+            logger.info(f"TPU-{index}: model run in {round(time.time() - init_time, 4)} seconds")
             batch = post_batch(batch, _h, _w)
-            logger.info(f"TPU-{index}: data post in {time.time() - init_time} seconds")
+            logger.info(f"TPU-{index}: data post in {round(time.time() - init_time, 4)} seconds")
             finish_time = time.time()
 
             if first_run:
                 first_run = False
                 logger.info(
-                    f"TPU-{index}: compilation done in {finish_time - init_time} seconds, out shape {batch.shape}"
+                    f"TPU-{index}: compilation done in {round(finish_time - init_time, 4)} seconds, out shape {batch.shape}"
                 )
             else:
                 logger.info(
-                    f"TPU-{index}: data processed in {finish_time - init_time} seconds, out shape {batch.shape}"
+                    f"TPU-{index}: data processed in {round(finish_time - init_time, 4)} seconds, out shape {batch.shape}"
                 )
 
             logger.info(f"TPU-{index}: starting async put_batch")
@@ -229,8 +223,7 @@ def tpu_worker_func(
             )
         except Exception as e:
             logger.error(f"TPU-{index}: ERROR - {e}")
-            traceback.print_exc()
-            logger.error(e)
+            logger.error(traceback.format_exc())
             continue
 
     for task in tasks:
@@ -252,7 +245,10 @@ def assign_worker_func(
     processed_tasks = 0
     tasks = []
 
+    vid_id = None
+
     def save_video_func(fps, final_out, metadata, vid_id):
+        logger.info(f"ASSIGN/ASYNC-{index}: {vid_id} - I have been summoned")
         with tempfile.NamedTemporaryFile(suffix=".mp4") as temp:
             out = cv2.VideoWriter(
                 temp.name, cv2.VideoWriter_fourcc(*"mp4v"), fps, (C_W, C_H)
@@ -311,9 +307,8 @@ def assign_worker_func(
 
             logger.info(f"ASSIGN/PROC-{index}: {index} waiting for file")
             obtained_obj = file_pipe.get()
-            logger.info(f"ASSIGN/PROC-{index}: {vid_id} received")
 
-            if obtained_obj is (None, None, None):
+            if obtained_obj == (None, None, None):
                 logger.info(f"ASSIGN/PROC-{index}: termination signal received")
                 for i in range(TPU_CORE_COUNT):
                     in_data_pipe.put(None, timeout=1)
@@ -322,6 +317,8 @@ def assign_worker_func(
                 break
 
             vid_id, mp4_bytes, metadata = obtained_obj
+
+            logger.info(f"ASSIGN/PROC-{index}: {vid_id} received")
 
             metadata = json.loads(metadata.decode("utf-8"))
 
@@ -414,7 +411,7 @@ def assign_worker_func(
                 # I EXPECT (B, H, W, C) AKA (16, 256, 256, 3)!!!!
                 # batch should be a numpy array, uint8, 0-255, (B, H, W, C)
                 logger.info(
-                    f"ASSIGN/PROC-{index}: {vid_id} - batch {i} sent with sahpe {batch['value'].shape}"
+                    f"ASSIGN/PROC-{index}: {vid_id} - batch {i} sent with shape {batch['value'].shape}"
                 )
                 batches_sent += 1
                 del batch
@@ -453,7 +450,7 @@ def assign_worker_func(
             logger.info(f"ASSIGN/PROC-{index}: {vid_id} - called save_video (Async)")
 
             gc_obj += gc.collect()
-            print(f"aw-{index}: {vid_id} - done, {gc_obj} objects collected")
+            logger.info(f"ASSIGN/PROC-{index}: {vid_id} - done, {gc_obj} objects collected")
 
             del vid_id
 
@@ -591,6 +588,12 @@ def wandb_worker_func(
     t_p: mp.Queue,
 ):
     
+    from datetime import datetime
+
+    def convert_unix_timestamp(unix_timestamp):
+        time = datetime.fromtimestamp(unix_timestamp)
+        return time.strftime("%H:%M:%S")
+    
     run_config = {
         "IN_DISK_PATH": IN_DISK_PATH,
         "OUT_DISK_PATH": OUT_DISK_PATH,
@@ -652,7 +655,7 @@ def wandb_worker_func(
             if data["type"] == "video_entry":
                 video_id, fps, duration, frame_count = data["data"]
                 logger.info(
-                    f"WANDB: video entry - vid_id: {video_id}, fps: {fps}, duration: {duration}, frame_count: {frame_count}"
+                    f"WANDB: video entry - vid_id: {video_id}, fps: {round(fps, 2)}, duration: {round(duration, 2)}, frame_count: {frame_count}"
                 )
                 videos += 1
                 frames += frame_count
@@ -677,7 +680,7 @@ def wandb_worker_func(
                 )
 
             logger.info(
-                f"WANDB: total stats - {videos} videos, {frames} frames, {hours} hours, {tars} tars, {frames / elapsed_time} fps, {videos / elapsed_time} vps, {tars / elapsed_time} tps"
+                f"WANDB: total stats - runtime: {convert_unix_timestamp(elapsed_time)} - {videos} videos, {frames} frames, {round(hours, 3)} hours, {tars} tars, {round(frames / elapsed_time, 2)} fps, {round(videos / elapsed_time, 3)} vps, {round(tars / elapsed_time, 3)} tps"
                 )
         except Exception as e:
             logger.error(f"WANDB: ERROR - {video_id} - {e}")
@@ -698,13 +701,13 @@ def out_pipe_manager(main_out_pipe: mp.Queue, secondary_out_pipes: list):
             worker_id = data["meta"]["aw_worker_index"]
             secondary_out_pipes[worker_id].put(data)
         except Exception as e:
-            logger.error(f"out_pipe_manager: ERROR - {e}")
+            logger.error(f"OUT_PIPE_MANAGER: ERROR - {e}")
             logger.error(traceback.format_exc())
             continue
 
 
 if __name__ == "__main__":
-    logger.info("main: started")
+    logger.info("MAIN: started")
 
     manager = mp.Manager()
 
@@ -796,22 +799,22 @@ if __name__ == "__main__":
     )
 
     ## wait for them to finish
-    logger.info("main: waiting for workers to finish")
+    logger.info("MAIN: waiting for workers to finish")
     wds_worker_process.join()
-    logger.info("main: wds_worker_process finished")
+    logger.info("MAIN: wds_worker_process finished")
     pipe_manager_process.join()
-    logger.info("main: pipe_manager_process finished")
+    logger.info("MAIN: pipe_manager_process finished")
     for assign_worker_process in assign_worker_processes:
         assign_worker_process.join()
-        logger.info("main: SOME assign_worker_process finished")
-    logger.info("main: assign_worker_processes finished")
+        logger.info("MAIN: SOME assign_worker_process finished")
+    logger.info("MAIN: assign_worker_processes finished")
     for tar_worker_process in tar_worker_processes:
         tar_worker_process.join()
-        logger.info("main: SOME tar_worker_process finished")
-    logger.info("main: tar_worker_processes finished")
+        logger.info("MAIN: SOME tar_worker_process finished")
+    logger.info("MAIN: tar_worker_processes finished")
 
     if USE_WANDB:
         wandb_pipe.put(None)
         wandb_worker_process.join()
 
-    logger.info("main: finished")
+    logger.info("MAIN: finished")
