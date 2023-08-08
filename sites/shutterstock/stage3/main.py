@@ -6,7 +6,6 @@ import math
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 import torch
-from im2im.main import load_model
 import numpy as np
 import io
 import tempfile
@@ -18,6 +17,7 @@ import psutil
 import cv2
 import threading
 import traceback
+from im2im.main import load_model
 
 mp.set_start_method("spawn", force=True)
 
@@ -26,9 +26,8 @@ mp.set_start_method("spawn", force=True)
 ## Paths
 IN_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage2/"
 OUT_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage3/"
-JSON_MAP_PATH = (
-    "/home/windowsuser/mount-folder/tempofunkds/shutterstock/nano/stage2_map.json"
-)
+JSON_MAP_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/nano/stage2_map.json"
+JSON_READ_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/nano/stage2_read.json"
 
 ## Wandb
 global USE_WANDB
@@ -41,7 +40,7 @@ LOG_MEMORY = True
 ## Multiprocessing
 ASSIGN_WORKER_COUNT = 4
 ASSIGN_WORKER_MAX_TASKS_PER_CHILD = 10
-TAR_WORKER_COUNT = 4
+TAR_WORKER_COUNT = 8
 TAR_SIZE = 128 * 1024 * 1024  # 512MB
 
 ## TPU Workers
@@ -80,7 +79,7 @@ class CustomLogger(logging.LoggerAdapter):
         return f"{get_memory()} - {msg}", kwargs
 
 logger = logging.getLogger(__name__)
-f_handler = logging.FileHandler("file.log")
+f_handler = logging.FileHandler("main.log")
 f_format = logging.Formatter(f"%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 f_handler.setFormatter(f_format)
 logger.addHandler(f_handler)
@@ -93,7 +92,14 @@ if LOG_MEMORY:
 def wds_reader_func(file_pipe: mp.Queue):
     logger.info("WDS: started")
     json_map = json.load(open(JSON_MAP_PATH, "r"))
+    json_read = json.load(open(JSON_READ_PATH, "r"))
     tar_map = list()
+    read_tars = list()
+
+    for entry in json_read:
+        read_tars.append(entry["tar"])
+        if entry in json_map:
+            json_map.remove(entry)
 
     for tar in json_map:
         tar_map.append(IN_DISK_PATH + tar)
@@ -108,6 +114,11 @@ def wds_reader_func(file_pipe: mp.Queue):
             logger.error(f"WDS: {sample['__key__']} ERROR - {e}")
             logger.error(traceback.format_exc())
             continue
+        finally:
+            tar_filename = sample["__url__"].split("/")[-1]
+            if tar_filename not in read_tars:
+                read_tars.append(tar_filename)
+                json.dump(read_tars, open(JSON_READ_PATH, "w"))
 
     file_pipe.put((None, None, None))
     logger.info("WDS: finished")
@@ -461,6 +472,7 @@ def assign_worker_func(
             logger.error(traceback.format_exc())
             continue
 
+    logger.info(f"ASSIGN/PROC-{index}: waiting for async tasks to finish")
     for task in tasks:
         task.join()
     logger.info(f"ASSIGN/PROC-{index}: exiting")
@@ -491,7 +503,9 @@ def assign_worker_manager(
                     keep_restarting,
                 ),
             )
+            logger.info(f"ASSIGN/MANAGER-{index}: worker started")
             child_process.start()
+            logger.info(f"ASSIGN/MANAGER-{index}: worker joined")
             child_process.join()
             gc.collect()
             logger.info(f"ASSIGN/MANAGER-{index}: worker exited")
@@ -560,12 +574,15 @@ def tar_worker_func(
                     name=f"{OUT_DISK_PATH}/{tar_id_val}.tar", mode="w"
                 ) as tar:
                     for vid_id, vid_bytes, meta_bytes in files_tar:
+                        logger.info(f"TAR-{index}: {vid_id} - writing to tar")
                         tarinfo = tarfile.TarInfo(name=f"{vid_id}.mp4")
                         tarinfo.size = len(vid_bytes)
                         tar.addfile(tarinfo, io.BytesIO(vid_bytes))
+                        logger.info(f"TAR-{index}: {vid_id} - video written to tar")
                         tarinfo = tarfile.TarInfo(name=f"{vid_id}.json")
                         tarinfo.size = len(meta_bytes)
                         tar.addfile(tarinfo, io.BytesIO(meta_bytes))
+                        logger.info(f"TAR-{index}: {vid_id} - meta written to tar")
                 files_tar = list()
                 files_size = 0
 
