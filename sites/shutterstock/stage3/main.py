@@ -260,6 +260,7 @@ def assign_worker_func(
 
     def save_video_func(fps, final_out, metadata, vid_id):
         logger.info(f"ASSIGN/ASYNC-{index}: {vid_id} - I have been summoned")
+        # final out is the tensor
         with tempfile.NamedTemporaryFile(suffix=".mp4") as temp:
             out = cv2.VideoWriter(
                 temp.name, cv2.VideoWriter_fourcc(*"mp4v"), fps, (C_W, C_H)
