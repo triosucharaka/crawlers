@@ -17,7 +17,7 @@ import traceback
 import jax.numpy as jnp
 import numpy as np
 import jax
-from diffusers import FlaxAutoencoderKL
+from transformers import CLIPTokenizer, FlaxCLIPTextModel
 from wrapt_timeout_decorator import *
 
 mp.set_start_method("spawn", force=True)
@@ -25,18 +25,19 @@ mp.set_start_method("spawn", force=True)
 ### Configuration ###
 
 ## Paths
-IN_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage3/"
-OUT_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage4/"
-JSON_MAP_PATH = "/home/windowsuser/crawlers/sites/shutterstock/stage4/map.json"
-JSON_READ_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/nano/stage4_read.json"
+IN_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage4/"
+OUT_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage5/"
+JSON_MAP_PATH = "/home/windowsuser/crawlers/sites/shutterstock/stage5/map.json"
+JSON_READ_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/nano/stage5_read.json"
 
-NPY_EXTENSION = "frames" # ex.: 00001.frames (not .npy, to differentiate with the text embeds on stage 5)
+NPY_EXTENSION = "cliptext" # ex.: 00001.cliptext (not .npy, to differentiate with the text embeds on stage 5)
+FRAMES_NPY_EXTENSION = "frames" # just to pass them over
 
 ## Wandb
 global USE_WANDB
 USE_WANDB = True
 WANDB_ENTITY = "peruano"  # none if not using wandb
-WANDB_PROJ = "debug_shutterstock_stage4"
+WANDB_PROJ = "debug_shutterstock_stage5"
 WANDB_NAME = f"mass_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
 LOG_MEMORY = True
 SPAWN_ON_EVERYTHING = False # wandb only grabs the current process logger, not global one, and also logs everything thats printed such as errors
@@ -55,12 +56,14 @@ TPU_BATCH_SIZE = 64
 MAX_SUPERBATCHES = 60
 
 ## Model Parameters
-VAE_MODEL_PATH = "CompVis/stable-diffusion-v1-4"
-VAE_MODEL_REVISION = "flax"
-VAE_MODEL_SUBFOLDER = "vae"
-C_C = 3
-C_H = 384  # (divisible by 64)
-C_W = 640  # (divisible by 64)
+### CLIP Tokenizer
+CLIP_TOKENIZER_MODEL_PATH = "CompVis/stable-diffusion-v1-4"
+CLIP_TOKENIZER_MODEL_REVISION = "flax"
+CLIP_TOKENIZER_MODEL_SUBFOLDER = "tokenizer"
+### CLIP Text Model
+CLIP_TEXT_MODEL_PATH = "CompVis/stable-diffusion-v1-4"
+CLIP_TEXT_MODEL_REVISION = "flax"
+CLIP_TEXT_MODEL_SUBFOLDER = "text_encoder"
 
 ## Pipes
 FILE_PIPE_MAX = 100
@@ -70,10 +73,6 @@ TAR_PIPE_MAX = 200
 WANDB_PIPE_MAX = 1000
 
 ### End Configuration ###
-
-assert C_C == 3, "C_C must be 3, for RGB"
-assert C_H % 64 == 0, "C_H must be divisible by 64"
-assert C_W % 64 == 0, "C_W must be divisible by 64"
 
 
 def get_memory():
@@ -139,7 +138,7 @@ def wds_reader_func(file_pipe: mp.Queue):
     for sample in dataset:
         try:
             logger.info(f"WDS: sending {sample['__key__']}")
-            file_pipe.put((sample["__key__"], sample["mp4"], sample["json"]))
+            file_pipe.put((sample["__key__"], sample[FRAMES_NPY_EXTENSION], sample["json"]))
         except Exception as e:
             logger.error(f"WDS: {sample['__key__']} ERROR - {e}")
             logger.error(traceback.format_exc())
@@ -163,43 +162,32 @@ def tpu_worker_func(
         run = probe(f"tpu_worker_{index}")
 
     weight_dtype = jnp.float16
-    vae, vae_params = FlaxAutoencoderKL.from_pretrained(
-        VAE_MODEL_PATH,
-        revision=VAE_MODEL_REVISION,
-        subfolder=VAE_MODEL_SUBFOLDER,
-        dtype=weight_dtype,
-    )
+    
+    tokenizer = CLIPTokenizer.from_pretrained(
+        CLIP_TOKENIZER_MODEL_PATH, 
+        revision=CLIP_TOKENIZER_MODEL_REVISION,
+        subfolder=CLIP_TOKENIZER_MODEL_SUBFOLDER)
+    text_encoder = FlaxCLIPTextModel.from_pretrained(
+        CLIP_TEXT_MODEL_PATH, 
+        revision=CLIP_TEXT_MODEL_REVISION,
+        subfolder=CLIP_TEXT_MODEL_SUBFOLDER,
+        dtype=weight_dtype)
+
     logger.info(f"TPU-{index}: model loaded")
 
-    expected_input_shape = (TPU_CORE_COUNT, TPU_BATCH_SIZE, C_C, C_H, C_W)
+    global_expected_shape = (TPU_CORE_COUNT, TPU_BATCH_SIZE, 77) 
+    # assuming we use the fixed 77-token length
+    # TODO: check if we should use the max len or some other value
 
     with tmp_c.get_lock():
         tmp_c.value += 1
 
-    def prep_batch(batch):
-        # batch is (D, B, H, W, C) (uint8) (0-255)
-        batch = np.transpose(batch, (0, 1, 4, 2, 3)) # (D, B, H, W, C) -> (D, B, C, H, W)
-        # (D, B, C, H, W) (uint8) (0-255)
-        assert batch.dtype == np.uint8, f"{batch.dtype} != uint8"
-        assert batch.max() <= 255, f"{batch.max()} > 255"
-        assert batch.min() >= 0, f"{batch.min()} < 0"
-        assert batch.shape == expected_input_shape, f"{batch.shape} != {expected_input_shape}"
-        batch = batch.astype(np.float32)
-        batch = batch / 255.0 # (D, B, C, H, W) (float32) (0-1)
-        # added 7/24/2023
-        batch = batch * 2.0 - 1.0
-        assert batch.dtype == np.float32, f"{batch.dtype} != float32"
-        assert batch.max() <= 1.0, f"{batch.max()} > 1.0"
-        assert batch.min() >= -1.0, f"{batch.min()} < -1.0"
-        gc.collect()
-        return batch
+    # NOTE: removed prep_batch as it's not needed.
     
-    def encode(img, rng, vae_params):
-        init_latent_dist = vae.apply({"params": vae_params}, img, method=vae.encode).latent_dist
-        latent_dist = init_latent_dist.sample(key=rng)
-        latent_dist = latent_dist.transpose((0, 3, 1, 2))
-        latent_dist = vae.config.scaling_factor * latent_dist
-        return latent_dist
+    def encode(input_ids: jnp.array, attention_mask: jnp.array):
+        # only returns `last_hidden_state`, that's what the diffusers
+        # SD pipeline uses too, so I guess it's that
+        return text_encoder(input_ids, attention_mask=attention_mask)[0]
     
     def create_key(seed=0):
         return jax.random.PRNGKey(seed)
@@ -238,7 +226,8 @@ def tpu_worker_func(
     work_done = False
     while True:
         try:
-            np_batch = list()
+            input_ids_batch = list()
+            attention_mask_batch = list()
             data_batch = list()
 
             logger.info(f"TPU-{index}: waiting for data")
@@ -247,13 +236,18 @@ def tpu_worker_func(
                 if data is None:
                     work_done = True
                     break
-                np_batch.append(data['value'])
+                input_ids_batch.append(data['value_input_ids'])
+                attention_mask_batch.append(data['value_attention_mask'])
                 data_batch.append(data['meta'])
 
             if work_done:
                 break
 
-            np_batch = np.stack(np_batch)
+            input_ids_batch = np.stack(input_ids_batch)
+            attention_mask_batch = np.stack(attention_mask_batch)
+
+            assert input_ids_batch.shape == global_expected_shape
+            assert attention_mask_batch.shape == global_expected_shape
 
             logger.info(f"TPU-{index}: data received")
 
@@ -261,15 +255,10 @@ def tpu_worker_func(
                 logger.info(f"TPU-{index}: first run, is always compilation")
             
             init_time = time.time()
-
-            value = prep_batch(np_batch) # (D, B, C, H, W) (float32) (-1, 1)
-            preparation_time = time.time() - init_time
-            logger.info(f"TPU-{index}: batch prepped in {preparation_time} seconds, value shape: {value.shape}")
-
-            total_frames = value.shape[0] * value.shape[1]
-
-            output = model(value, rng, vae_params).block_until_ready()
-            modeling_time = time.time() - init_time - preparation_time
+            total_texts = input_ids_batch.shape[0] * input_ids_batch.shape[1]
+            # encode(input_ids: jnp.array, attention_mask: jnp.array):
+            output = model(input_ids_batch, attention_mask_batch).block_until_ready()
+            modeling_time = time.time() - init_time - init_time
 
             if first_run:
                 logger.info(f"TPU-{index}: compiled in {modeling_time} seconds")
