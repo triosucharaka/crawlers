@@ -1,3 +1,11 @@
+# Stages Info.:
+
+- Stage 1: Site Mapping
+- Stage 2: Dataset Download and organizing
+- Stage 3: Dataset De-watermarking (im2im/*-swmm)
+- Stage 4: Frame Encoding (VAE/AutoencoderKL)
+- Stage 5: Caption Encoding (CLIPTextModel/clip-vit-large-patch14)
+
 ### SQL DB download for stage 2
 
 SQL DB download path (authenticated):
