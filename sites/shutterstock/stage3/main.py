@@ -17,6 +17,7 @@ import psutil
 import cv2
 import threading
 import traceback
+import os
 from im2im.main import load_model
 from wrapt_timeout_decorator import *
 
@@ -27,15 +28,15 @@ mp.set_start_method("spawn", force=True)
 ## Paths
 IN_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage2/videos/"
 OUT_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage3/0/"
-JSON_MAP_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/nano/stage2_map.json"
-JSON_READ_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/nano/stage2_read.json"
+JSON_MAP_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/nano/output1.json"
+JSON_READ_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/nano/stage2_instance1.json"
 
 ## Wandb
 global USE_WANDB
 USE_WANDB = True
 WANDB_ENTITY = "peruano"  # none if not using wandb
 WANDB_PROJ = "shutterstock_stage3"
-WANDB_NAME = f"stage3_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
+WANDB_NAME = f"stage3_instace1_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
 LOG_MEMORY = True
 
 ## Multiprocessing
@@ -95,7 +96,10 @@ if LOG_MEMORY:
 def wds_reader_func(file_pipe: mp.Queue):
     logger.info("WDS: started")
     json_map = json.load(open(JSON_MAP_PATH, "r"))
-    json_read = json.load(open(JSON_READ_PATH, "r"))
+    if os.path.exists(JSON_READ_PATH):
+        json_read = json.load(open(JSON_READ_PATH, "r"))
+    else:
+        json_read = list()
     tar_map = list()
     read_tars = list()
 
