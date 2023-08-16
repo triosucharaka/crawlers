@@ -18,14 +18,15 @@ import cv2
 import threading
 import traceback
 from im2im.main import load_model
+from wrapt_timeout_decorator import *
 
 mp.set_start_method("spawn", force=True)
 
 ### Configuration ###
 
 ## Paths
-IN_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage2/"
-OUT_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage3/"
+IN_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage2/videos/"
+OUT_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage3/0/"
 JSON_MAP_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/nano/stage2_map.json"
 JSON_READ_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/nano/stage2_read.json"
 
@@ -33,7 +34,7 @@ JSON_READ_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/nano/s
 global USE_WANDB
 USE_WANDB = True
 WANDB_ENTITY = "peruano"  # none if not using wandb
-WANDB_PROJ = "debug_shutterstock_stage3"
+WANDB_PROJ = "shutterstock_stage3"
 WANDB_NAME = f"stage3_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
 LOG_MEMORY = True
 
@@ -41,7 +42,9 @@ LOG_MEMORY = True
 ASSIGN_WORKER_COUNT = 4
 ASSIGN_WORKER_MAX_TASKS_PER_CHILD = 10
 TAR_WORKER_COUNT = 8
-TAR_SIZE = 128 * 1024 * 1024  # 512MB
+TAR_SIZE = 512 * 1024 * 1024  # 512MB
+TAR_INDIV_TIMEOUT = 15 # seconds
+TAR_WORKER_MAX_TASKS_PER_CHILD = 5
 
 ## TPU Workers
 TPU_CORE_COUNT = 4
@@ -521,6 +524,21 @@ def assign_worker_manager(
 def tar_worker_func(
     index: int, tar_pipe: mp.Queue, wandb_pipe: mp.Queue, tar_id: mp.Value
 ):
+    processed_tasks = 0
+
+    @timeout(TAR_INDIV_TIMEOUT)
+    def add2tar(files_tuple, tar):
+        vid_id, vid_bytes, meta_bytes = files_tuple
+        logger.info(f"TAR-{index}: {vid_id} - writing to tar")
+        tarinfo = tarfile.TarInfo(name=f"{vid_id}.mp4")
+        tarinfo.size = len(vid_bytes)
+        tar.addfile(tarinfo, io.BytesIO(vid_bytes))
+        logger.info(f"TAR-{index}: {vid_id} - mp4 written to tar")
+        tarinfo = tarfile.TarInfo(name=f"{vid_id}.json")
+        tarinfo.size = len(meta_bytes)
+        tar.addfile(tarinfo, io.BytesIO(meta_bytes))
+        logger.info(f"TAR-{index}: {vid_id} - meta written to tar")
+
     files_tar = list()
     files_size = 0
     vid_id = None # for error handling without pipe.get
@@ -529,6 +547,12 @@ def tar_worker_func(
 
     while True:
         try:
+            if processed_tasks >= TAR_WORKER_MAX_TASKS_PER_CHILD:
+                logger.info(
+                    f"TAR/PROC-{index}: processed {processed_tasks} tasks (max tasks per child), restarting"
+                )
+                break
+
             logger.info(f"TAR-{index}: waiting for data")
             vid_id, vid_bytes, meta_bytes, meta = tar_pipe.get()
             logger.info(f"TAR-{index}: got data")
@@ -571,23 +595,40 @@ def tar_worker_func(
                 # make sure we dont use the ones from current itteration
                 del vid_id, vid_bytes, meta_bytes, meta
 
+                success_files = 0
+                fail_files = 0
+
                 with tarfile.open(
                     name=f"{OUT_DISK_PATH}/{tar_id_val}.tar", mode="w"
                 ) as tar:
-                    for vid_id, vid_bytes, meta_bytes in files_tar:
-                        logger.info(f"TAR-{index}: {vid_id} - writing to tar")
-                        tarinfo = tarfile.TarInfo(name=f"{vid_id}.mp4")
-                        tarinfo.size = len(vid_bytes)
-                        tar.addfile(tarinfo, io.BytesIO(vid_bytes))
-                        logger.info(f"TAR-{index}: {vid_id} - video written to tar")
-                        tarinfo = tarfile.TarInfo(name=f"{vid_id}.json")
-                        tarinfo.size = len(meta_bytes)
-                        tar.addfile(tarinfo, io.BytesIO(meta_bytes))
-                        logger.info(f"TAR-{index}: {vid_id} - meta written to tar")
+                    for files_tuple in files_tar:
+                        vid_id = files_tuple[0]
+                        try:
+                            add2tar(files_tuple, tar)
+                            success_files += 1
+                            logger.info(
+                                f"TAR/PROC-{index}: {vid_id} - successfully written to tar"
+                            )
+                        except TimeoutError:
+                            fail_files += 1
+                            logger.error(
+                                f"TAR/PROC-{index}: {vid_id} - ERROR - timeout while writing to tar"
+                            )
+                            logger.error(traceback.format_exc())
+                            continue
+                        except Exception as e:
+                            fail_files += 1
+                            logger.error(
+                                f"TAR/PROC-{index}: {vid_id} - ERROR - {e}"
+                            )
+                            logger.error(traceback.format_exc())
+                            continue
                 files_tar = list()
                 files_size = 0
 
-                logger.info(f"TAR-{index}: {tar_id_val} - tar written to disk")
+                processed_tasks += 1
+
+                logger.info(f"TAR/PROC-{index}: {tar_id_val} - tar written to disk, with {success_files} files, and {fail_files} failutes, total processed tasks {processed_tasks}")
 
                 if USE_WANDB:
                     wandb_pipe.put({"type": "tar_entry", "data": None})
@@ -596,6 +637,32 @@ def tar_worker_func(
             logger.error(traceback.format_exc())
             continue
 
+def tar_worker_manager(
+    index: int, tar_pipe: mp.Queue, wandb_pipe: mp.Queue, tar_id: mp.Value
+):
+    logger.info(f"TAR/MANAGER-{index}: started")
+
+    keep_restarting = mp.Value("i", 1)
+
+    while keep_restarting.value == 1:
+        try:
+            logger.info(f"TAR/MANAGER-{index}: starting worker")
+            tar_worker = mp.Process(
+                target=tar_worker_func,
+                args=(index, tar_pipe, wandb_pipe, tar_id, keep_restarting,),
+            )
+            logger.info(f"TAR/MANAGER-{index}: worker created")
+            tar_worker.start()
+            logger.info(f"TAR/MANAGER-{index}: worker started")
+            tar_worker.join()
+            gc.collect()
+            logger.info(f"TAR/MANAGER-{index}: worker exited/joined")
+        except Exception as e:
+            logger.error(f"TAR/MANAGER-{index}: ERROR - {e}")
+            logger.error(traceback.format_exc())
+            continue
+
+    logger.info(f"TAR/MANAGER-{index}: exiting")
 
 def wandb_worker_func(
     wandb_pipe: mp.Queue,

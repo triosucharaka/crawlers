@@ -25,13 +25,12 @@ mp.set_start_method("spawn", force=True)
 ### Configuration ###
 
 ## Paths
-IN_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage4/"
+IN_DISK_PATH = "internetoverdose/tempofunkds/shutterstock/stage4/"
 OUT_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage5/"
-JSON_MAP_PATH = "/home/windowsuser/crawlers/sites/shutterstock/stage5/map.json"
-JSON_READ_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/nano/stage5_read.json"
+JSON_MAP_PATH = "map.json"
+JSON_READ_PATH = "stage5_read.json"
 
 NPY_EXTENSION = "cliptext" # ex.: 00001.cliptext (not .npy, to differentiate with the text embeds on stage 5)
-FRAMES_NPY_EXTENSION = "frames" # just to pass them over
 
 ## Wandb
 global USE_WANDB
@@ -43,9 +42,9 @@ LOG_MEMORY = True
 SPAWN_ON_EVERYTHING = False # wandb only grabs the current process logger, not global one, and also logs everything thats printed such as errors
 
 ## Multiprocessing
-ASSIGN_WORKER_COUNT = 4
+ASSIGN_WORKER_COUNT = 1
 ASSIGN_WORKER_MAX_TASKS_PER_CHILD = 10
-TAR_WORKER_COUNT = 4
+TAR_WORKER_COUNT = 1
 TAR_SIZE = 128 * 1024 * 1024  # 512MB
 TAR_INDIV_TIMEOUT = 15 # seconds
 TAR_WORKER_MAX_TASKS_PER_CHILD = 5
@@ -53,7 +52,6 @@ TAR_WORKER_MAX_TASKS_PER_CHILD = 5
 ## TPU Workers
 TPU_CORE_COUNT = 4
 TPU_BATCH_SIZE = 64
-MAX_SUPERBATCHES = 60
 
 ## Model Parameters
 ### CLIP Tokenizer
@@ -66,10 +64,10 @@ CLIP_TEXT_MODEL_REVISION = "flax"
 CLIP_TEXT_MODEL_SUBFOLDER = "text_encoder"
 
 ## Pipes
-FILE_PIPE_MAX = 100
-IN_DATA_PIPE_MAX = 400
-OUT_DATA_PIPE_MAX = 400
-TAR_PIPE_MAX = 200
+FILE_PIPE_MAX = 512
+IN_DATA_PIPE_MAX = 1024
+OUT_DATA_PIPE_MAX = 1024
+TAR_PIPE_MAX = 1024
 WANDB_PIPE_MAX = 1000
 
 ### End Configuration ###
@@ -131,14 +129,14 @@ def wds_reader_func(file_pipe: mp.Queue):
     logger.info(f"WDS: {len(json_map)} tars to read")
 
     for tar in json_map:
-        tar_map.append(IN_DISK_PATH + tar)
+        tar_map.append("gs://" + IN_DISK_PATH + tar)
 
     dataset = wds.WebDataset(tar_map)
 
     for sample in dataset:
         try:
-            logger.info(f"WDS: sending {sample['__key__']}")
-            file_pipe.put((sample["__key__"], sample[FRAMES_NPY_EXTENSION], sample["json"]))
+            logger.info(f"WDS: sending {sample['__key__']}, from {sample['__url__']}")
+            file_pipe.put((sample["__key__"], sample["json"]))
         except Exception as e:
             logger.error(f"WDS: {sample['__key__']} ERROR - {e}")
             logger.error(traceback.format_exc())
@@ -149,7 +147,7 @@ def wds_reader_func(file_pipe: mp.Queue):
                 read_tars.append(tar_filename)
                 json.dump(read_tars, open(JSON_READ_PATH, "w"))
 
-    file_pipe.put((None, None, None))
+    file_pipe.put((None,None))
     logger.info("WDS: finished")
 
 
@@ -163,10 +161,6 @@ def tpu_worker_func(
 
     weight_dtype = jnp.float16
     
-    tokenizer = CLIPTokenizer.from_pretrained(
-        CLIP_TOKENIZER_MODEL_PATH, 
-        revision=CLIP_TOKENIZER_MODEL_REVISION,
-        subfolder=CLIP_TOKENIZER_MODEL_SUBFOLDER)
     text_encoder = FlaxCLIPTextModel.from_pretrained(
         CLIP_TEXT_MODEL_PATH, 
         revision=CLIP_TEXT_MODEL_REVISION,
@@ -175,7 +169,8 @@ def tpu_worker_func(
 
     logger.info(f"TPU-{index}: model loaded")
 
-    global_expected_shape = (TPU_CORE_COUNT, TPU_BATCH_SIZE, 77) 
+    output_expected_shape = (TPU_CORE_COUNT, TPU_BATCH_SIZE, 77, 768)
+    input_expected_shape = (TPU_CORE_COUNT, TPU_BATCH_SIZE, 77)
     # assuming we use the fixed 77-token length
     # TODO: check if we should use the max len or some other value
 
@@ -188,12 +183,8 @@ def tpu_worker_func(
         # only returns `last_hidden_state`, that's what the diffusers
         # SD pipeline uses too, so I guess it's that
         return text_encoder(input_ids, attention_mask=attention_mask)[0]
-    
-    def create_key(seed=0):
-        return jax.random.PRNGKey(seed)
-    
-    rng = create_key(0)
-    model = jax.pmap(encode, in_axes=(0, None, None))
+
+    model = jax.pmap(encode, in_axes=(0, 0,))
 
     tasks = list()
 
@@ -201,7 +192,11 @@ def tpu_worker_func(
         try:
             logger.info(f"TPU-{index}/ASYNC: placing batch")
             
+            # given tensor is (TPU_CORE_COUNT, TPU_BATCH_SIZE, 77, 768)
+            # so tensor placed on outpipe is (TPU_BATCH_SIZE, 77, 768)
             output = np.array(tensor)
+
+            assert output.shape == output_expected_shape
 
             for i in range(TPU_CORE_COUNT):
                 out_data_pipe.put(
@@ -236,9 +231,21 @@ def tpu_worker_func(
                 if data is None:
                     work_done = True
                     break
-                input_ids_batch.append(data['value_input_ids'])
-                attention_mask_batch.append(data['value_attention_mask'])
+                """
+                {
+                    "value": {
+                        "input_ids": np.array,
+                        "attention_mask": np.array,
+                    },
+                    "meta": {
+                        "key": str,
+                    },
+                }
+                """
+                input_ids_batch.append(data['value']['input_ids'])
+                attention_mask_batch.append(data['value']['attention_mask'])
                 data_batch.append(data['meta'])
+                logger.info(f"TPU-{index}: data received, {i+1}/{TPU_CORE_COUNT}")
 
             if work_done:
                 break
@@ -246,25 +253,25 @@ def tpu_worker_func(
             input_ids_batch = np.stack(input_ids_batch)
             attention_mask_batch = np.stack(attention_mask_batch)
 
-            assert input_ids_batch.shape == global_expected_shape
-            assert attention_mask_batch.shape == global_expected_shape
+            assert input_ids_batch.shape == input_expected_shape
+            assert attention_mask_batch.shape == input_expected_shape
 
             logger.info(f"TPU-{index}: data received")
 
             if first_run:
                 logger.info(f"TPU-{index}: first run, is always compilation")
             
-            init_time = time.time()
             total_texts = input_ids_batch.shape[0] * input_ids_batch.shape[1]
+            init_time = time.time()
             # encode(input_ids: jnp.array, attention_mask: jnp.array):
             output = model(input_ids_batch, attention_mask_batch).block_until_ready()
-            modeling_time = time.time() - init_time - init_time
+            modeling_time = time.time() - init_time
 
             if first_run:
                 logger.info(f"TPU-{index}: compiled in {modeling_time} seconds")
                 first_run = False
             else:
-                logger.info(f"TPU-{index}: modeled in {modeling_time} seconds - fps: {total_frames / modeling_time}")
+                logger.info(f"TPU-{index}: modeled in {modeling_time} seconds - fps: {total_texts / modeling_time}")
 
             put_batch(output, data_batch)
             
@@ -291,37 +298,30 @@ def assign_worker_func(
 ):
     logger.info(f"ASSIGN/PROC-{index}: started")
 
+    tokenizer = CLIPTokenizer.from_pretrained(
+        CLIP_TOKENIZER_MODEL_PATH, 
+        revision=CLIP_TOKENIZER_MODEL_REVISION,
+        subfolder=CLIP_TOKENIZER_MODEL_SUBFOLDER)
+
     processed_tasks = 0
     tasks = []
-
     vid_id = None
 
-    def save_video_func(fps, final_out: np.array, metadata, vid_id):
+    def save_func(vid_id,vid_meta, vid_embeds):
         logger.info(f"ASSIGN/ASYNC-{index}: {vid_id} - I have been summoned")
 
-        swap_meta = {
-            "np_frame_count": final_out.shape[0],
-            "np_height": final_out.shape[2], # axis 1 is latent channels (4)
-            "np_width": final_out.shape[3],
-        }
+        embed_bytes = io.BytesIO()
+        np.save(embed_bytes, vid_embeds, allow_pickle=False)
+        embed_bytes = embed_bytes.getvalue()
 
-        numpy_bytes = io.BytesIO()
-        np.save(numpy_bytes, final_out, allow_pickle=False)
-        numpy_bytes = numpy_bytes.getvalue()
-
-        metadata = {**metadata, **swap_meta}
-
-        logger.info(
-            f"ASSIGN/ASYNC-{index}: {vid_id} - {NPY_EXTENSION} encoded, {len(numpy_bytes)/1024/1024} MB with {final_out.shape[0]} frames"
-        )
-
-        metadata_bytes = json.dumps(metadata).encode("utf-8")  # json metadata bytes
-        tar_pipe.put((vid_id, numpy_bytes, metadata_bytes, metadata))  # str, bytes, bytes
+        metadata_bytes = json.dumps(vid_meta).encode("utf-8")  # json metadata bytes
+        
+        tar_pipe.put((vid_id, metadata_bytes, embed_bytes))
         logger.info(f"ASSIGN/ASYNC-{index}: {vid_id} - sent to tar worker")
 
-    def save_video(fps, final_out, metadata, vid_id):
+    def tar_save(vid_id: int, vid_meta: dict, vid_embeds: jnp.array):
         task_thead = threading.Thread(
-            target=save_video_func, args=(fps, final_out, metadata, vid_id)
+            target=save_func, args=(vid_id, vid_meta, vid_embeds,)
         )
         task_thead.start()
         tasks.append(task_thead)
@@ -334,165 +334,99 @@ def assign_worker_func(
                 )
                 break
 
-            gc_obj = 0
+            superbatch = list()
 
-            logger.info(f"ASSIGN/PROC-{index}: {index} waiting for file")
-            obtained_obj = file_pipe.get()
+            ### Tokenizing and batching ###
 
-            if obtained_obj == (None, None, None):
-                logger.info(f"ASSIGN/PROC-{index}: termination signal received")
-                for i in range(TPU_CORE_COUNT):
-                    in_data_pipe.put(None, timeout=1)
-                    tar_pipe.put((None, None, None, None), timeout=1)
-                    keep_restarting.value = 0
-                break
+            for a in range(TPU_CORE_COUNT):
+                batch = list()
 
-            vid_id, mp4_bytes, metadata = obtained_obj
+                for i in range(TPU_BATCH_SIZE):
+                    logger.info(f"ASSIGN/PROC-{index}: loading video {i}")
+                    obtained_obj = file_pipe.get()
 
-            logger.info(f"ASSIGN/PROC-{index}: {vid_id} received")
-
-            metadata = json.loads(metadata.decode("utf-8"))
-
-            ## Try predicting to avoid unnecessary processing
-            if float(metadata["duration"]) > 10 * 60:
-                # NOTE: not that we cannot split it, but rather could use too much memory when resizing.
-                logger.info(
-                    f"ASSIGN/PROC-{index}: {vid_id} - {metadata['duration']} > 10*60, during prediction, skipping"
-                )
-                continue
-
-            predicted_frame_count = int(
-                float(metadata["fps"]) * float(metadata["duration"])
-            )
-            predicted_superbatch_count = predicted_frame_count // TPU_BATCH_SIZE
-            if predicted_superbatch_count > MAX_SUPERBATCHES:
-                predicted_superbatch_count = MAX_SUPERBATCHES
-            predicted_superbatch_count = predicted_superbatch_count // TPU_CORE_COUNT
-            if predicted_superbatch_count < 1:
-                logger.info(
-                    f"ASSIGN/PROC-{index}: {vid_id} - {predicted_superbatch_count} < 1, during prediction, skipping"
-                )
-                continue
-
-            logger.info(f"ASSIGN/PROC-{index}: {vid_id} loading video")
-            with tempfile.NamedTemporaryFile() as temp:
-                temp.write(mp4_bytes)
-                temp.flush()
-                video_cap = cv2.VideoCapture(temp.name)
-
-                resized_frames = []
-
-                logger.info(f"ASSIGN/PROC-{index}: {vid_id} resizing video")
-                while True:
-                    ret, frame = video_cap.read()
-                    if not ret:
+                    if obtained_obj == (None, None):
+                        logger.info(f"ASSIGN/PROC-{index}: termination signal received")
+                        for i in range(TPU_CORE_COUNT):
+                            in_data_pipe.put(None, timeout=1)
+                            tar_pipe.put((None, None, None), timeout=1)
+                            keep_restarting.value = 0
                         break
-                    resized_frame = cv2.resize(
-                        cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), (C_W, C_H)
-                    )
-                    numpy_frame = np.array(resized_frame)
-                    resized_frames.append(numpy_frame)
-                logger.info(f"ASSIGN/PROC-{index}: {vid_id} video resized")
 
-                frames = np.array(resized_frames)  # (T, H, W, C)
-                frame_count = frames.shape[0]
-                fps = video_cap.get(cv2.CAP_PROP_FPS)
+                    vid_id, metadata = obtained_obj
 
-                del video_cap, resized_frames, resized_frame, numpy_frame, frame, mp4_bytes
+                    logger.info(f"ASSIGN/PROC-{index}: {vid_id} received")
 
-            logger.info(f"ASSIGN/PROC-{index}: {vid_id} video loaded")
+                    metadata = json.loads(metadata.decode("utf-8"))
+                    description = str(metadata['description'])
 
-            if frame_count < TPU_BATCH_SIZE:
-                logger.info(
-                    f"ASSIGN/PROC-{index}: {vid_id} - {frame_count} < {TPU_BATCH_SIZE}, skipping"
+                    batch.append((vid_id, metadata, description))
+
+                if keep_restarting.value == 0:
+                    break
+
+                tokens = tokenizer(
+                    [x[2] for x in batch],
+                    padding="max_length",
+                    max_length=tokenizer.model_max_length,
+                    truncation=True,
+                    return_tensors="np",
                 )
-                continue
 
-            # batch = (f, f, f, f, .. 16 times) # 16 frames
-            # superbatch = (b, b, b, b, ...Y times) # Y splits where Y is the frame_count // TPU_BATCH_SIZE
+                superbatch.append((
+                    [x[0] for x in batch], # vid_id, list of strings
+                    [x[1] for x in batch], # metadata, list of dicts
+                    tokens # dict with keys: input_ids, attention_mask
+                ))
 
-            # Divide video into batches
-            superbatch_count = frame_count // TPU_BATCH_SIZE
-            if superbatch_count > MAX_SUPERBATCHES:
-                superbatch_count = MAX_SUPERBATCHES
-            superbatch_count = superbatch_count // TPU_CORE_COUNT  # to fit exactly
-            if superbatch_count < 1:
-                logger.info(f"ASSIGN/PROC-{index}: {vid_id} - {superbatch_count} < 1, skipping (no superbatches)")
-                continue
-            superbatch_count = superbatch_count * TPU_CORE_COUNT
-            logger.info(
-                f"ASSIGN/PROC-{index}: {vid_id} - using {superbatch_count * TPU_BATCH_SIZE}/{frame_count} frames, {superbatch_count} megabatches"
-            )
+            ### Send to TPUs ###
 
-            batches_sent = 0
+            for i in range(TPU_CORE_COUNT):
+                in_data_pipe.put({
+                    "value": {
+                        "input_ids": superbatch[i][2]["input_ids"],
+                        "attention_mask": superbatch[i][2]['attention_mask']
+                    },
+                    "meta": {
+                        "superbatch_id": i,
+                        "aw_worker_index": index,
+                    }
+                })
 
-            logger.info(f"ASSIGN/PROC-{index}: {vid_id} - sending batches to TPU workers")
-            for i in range(superbatch_count):
-                batch = frames[range(i * TPU_BATCH_SIZE, (i + 1) * TPU_BATCH_SIZE)]
-                assert batch.shape[3] == C_C
-                assert batch.shape[0] == TPU_BATCH_SIZE
-                assert batch.dtype == np.uint8
-                assert batch.min() >= 0
-                assert batch.max() <= 255
-                batch = {
-                    "value": batch,
-                    "meta": {"batch_id": i, "aw_worker_index": index, "vid_id": vid_id},
-                }
-                in_data_pipe.put(batch)
-                # I EXPECT (B, H, W, C) AKA (16, 256, 256, 3)!!!!
-                # batch should be a numpy array, uint8, 0-255, (B, H, W, C)
-                logger.info(
-                    f"ASSIGN/PROC-{index}: {vid_id} - batch {i} sent with shape {batch['value'].shape}"
-                )
-                batches_sent += 1
-                del batch
-            logger.info(f"ASSIGN/PROC-{index}: {vid_id} - bastches sent to TPU workers")
-
-            del frames
-            gc_obj += gc.collect()
-
-            ### RETRIVAL ###
+            ### Retrieve Output ###
 
             output_superbatch = list()
 
-            while batches_sent != 0:
-                batch = out_data_pipe.get()
-                if batch["meta"]["aw_worker_index"] != index:
-                    # NOTE: previously this was a delay, but now that we have the pipe manager, this should never happen
-                    raise Exception(
-                        f"ASSIGN/PROC-{index}: {vid_id} - batch {batch['meta']['batch_id']} received from wrong worker, got {batch['meta']['aw_worker_index']}, expected {index}"
-                    )
-                batch_id = batch["meta"]["batch_id"]
-                batches_sent -= 1
-                # add batch at the correct index
-                output_superbatch.append({"o": batch_id, "v": batch["value"]})
-                logger.info(f"ASSIGN/PROC-{index}: {vid_id} - batch {batch_id} received")
-                del batch, batch_id
+            for i in range(TPU_CORE_COUNT):
+                output = out_data_pipe.get()
+                assert output["meta"]["aw_worker_index"] == index
 
-            ### ORGANIZING ###
+                output_superbatch.append({
+                    "o": output["meta"]['superbatch_id'],
+                    "v": output["value"] # just a jnp array
+                })
+
+            ### Organize and send ###
 
             output_superbatch.sort(key=lambda x: x["o"])
             output_superbatch = [x["v"] for x in output_superbatch]
-            logger.info(f"ASSIGN/PROC-{index}: {vid_id} - all batches received")
-            final_out = np.concatenate(output_superbatch, axis=0)
 
-            expected_out_shape = (TPU_BATCH_SIZE * superbatch_count, 4, C_H/8, C_W/8)
-            assert final_out.shape == expected_out_shape
+            for i in range(TPU_CORE_COUNT):
+                video_ids = superbatch[i][0]
+                video_metas = superbatch[i][1]
+                video_embeds = output_superbatch[i]
 
-            logger.info(
-                f"ASSIGN/PROC-{index}: {vid_id} - final output shape {final_out.shape}, writing numpy..."
-            )
+                assert len(video_ids) == len(video_metas) == video_embeds.shape[0]
 
-            save_video(fps, final_out, metadata, vid_id)
+                for z in range(len(video_ids)):
+                    out_tuple = (
+                        video_ids[z],       # int
+                        video_metas[z],     # dict
+                        video_embeds[z],    # jnp array
+                    )
 
-            logger.info(f"ASSIGN/PROC-{index}: {vid_id} - called save_video (Async)")
+                    tar_save(*out_tuple)
 
-            gc_obj += gc.collect()
-            logger.info(f"ASSIGN/PROC-{index}: {vid_id} - done, {gc_obj} objects collected")
-
-            del vid_id
-
-            processed_tasks += 1
             logger.info(f"ASSIGN/PROC-{index}: {processed_tasks} tasks processed")
         except Exception as e:
             logger.error(f"ASSIGN/PROC-{index}: {vid_id} - ERROR - {e}")
@@ -554,16 +488,20 @@ def tar_worker_func(
 
     @timeout(TAR_INDIV_TIMEOUT)
     def add2tar(files_tuple, tar):
-        vid_id, npy_bytes, meta_bytes = files_tuple
+        vid_id, vid_meta, vid_embeds = files_tuple
         logger.info(f"TAR-{index}: {vid_id} - writing to tar")
-        tarinfo = tarfile.TarInfo(name=f"{vid_id}.{NPY_EXTENSION}")
-        tarinfo.size = len(npy_bytes)
-        tar.addfile(tarinfo, io.BytesIO(npy_bytes))
-        logger.info(f"TAR-{index}: {vid_id} - {NPY_EXTENSION} written to tar")
+
+        # video metadata
         tarinfo = tarfile.TarInfo(name=f"{vid_id}.json")
-        tarinfo.size = len(meta_bytes)
-        tar.addfile(tarinfo, io.BytesIO(meta_bytes))
+        tarinfo.size = len(vid_meta)
+        tar.addfile(tarinfo, io.BytesIO(vid_meta))
         logger.info(f"TAR-{index}: {vid_id} - meta written to tar")
+
+        # video embeddings
+        tarinfo = tarfile.TarInfo(name=f"{vid_id}.{NPY_EXTENSION}")
+        tarinfo.size = len(vid_embeds)
+        tar.addfile(tarinfo, io.BytesIO(vid_embeds))
+        logger.info(f"TAR-{index}: {vid_id} - {NPY_EXTENSION} written to tar")
     
     if SPAWN_ON_EVERYTHING:
         run = probe(f"tar_worker_{index}")
@@ -583,27 +521,25 @@ def tar_worker_func(
                 break
 
             logger.info(f"TAR/PROC-{index}: waiting for data")
-            vid_id, npy_bytes, meta_bytes, meta = tar_pipe.get()
+            vid_id, vid_meta, vid_embeds = tar_pipe.get()
             logger.info(f"TAR/PROC-{index}: got data")
 
-            if all(x is None for x in [vid_id, npy_bytes, meta_bytes, meta]):
+            if all(x is None for x in [vid_id, vid_meta, vid_embeds]):
                 logger.info(f"TAR/PROC-{index}: got None, exiting")
                 keep_restarting.value = 0
                 if USE_WANDB:
                     wandb_pipe.put(None)
                 break
 
-            files_tar.append((vid_id, npy_bytes, meta_bytes))
-            files_size += len(npy_bytes) + len(meta_bytes)
+            files_tar.append((vid_id,  vid_meta, vid_embeds))
+            files_size += len(vid_embeds)
+
             if USE_WANDB:
                 wandb_pipe.put(
                     {
                         "type": "video_entry",
                         "data": (
                             vid_id,
-                            meta["cv_fps"],
-                            meta["np_frame_count"] / meta["cv_fps"],
-                            meta["np_frame_count"],
                         ),
                     }
                 )
@@ -623,7 +559,7 @@ def tar_worker_func(
                 tar_id_val = str(tar_id_val).zfill(6)
 
                 # make sure we dont use the ones from current itteration
-                del vid_id, npy_bytes, meta_bytes, meta
+                del vid_id, vid_meta, vid_embeds
 
                 success_files = 0
                 fail_files = 0
@@ -723,13 +659,6 @@ def wandb_worker_func(
         "TAR_SIZE": TAR_SIZE,
         "TPU_CORE_COUNT": TPU_CORE_COUNT,
         "TPU_BATCH_SIZE": TPU_BATCH_SIZE,
-        "MAX_SUPERBATCHES": MAX_SUPERBATCHES,
-        "VAE_MODEL_PATH": VAE_MODEL_PATH,
-        "VAE_MODEL_REVISION": VAE_MODEL_REVISION,
-        "VAE_MODEL_SUBFOLDER": VAE_MODEL_SUBFOLDER,
-        "C_C": C_C,
-        "C_H": C_H,
-        "C_W": C_W,
         "FILE_PIPE_MAX": FILE_PIPE_MAX,
         "IN_DATA_PIPE_MAX": IN_DATA_PIPE_MAX,
         "OUT_DATA_PIPE_MAX": OUT_DATA_PIPE_MAX,
@@ -745,8 +674,6 @@ def wandb_worker_func(
     
     init_time = time.time()
 
-    frames = 0
-    hours = 0
     videos = 0
     tars = 0
 
@@ -773,15 +700,13 @@ def wandb_worker_func(
                 break
 
             if data["type"] == "video_entry":
-                video_id, fps, duration, frame_count = data["data"]
+                video_id = data["data"]
                 logger.info(
-                    f"WANDB: video entry - vid_id: {video_id}, fps: {round(fps, 2)}, duration: {round(duration, 2)}, frame_count: {frame_count}"
+                    f"WANDB: video entry - vid_id: {video_id}"
                 )
                 videos += 1
-                frames += frame_count
-                hours += duration / 3600
                 run.log(
-                    {"videos": videos, "frames": frames, "hours": hours}, step=elapsed_time
+                    {"videos": videos}, step=elapsed_time
                 )
 
             elif data["type"] == "tar_entry":
@@ -792,7 +717,6 @@ def wandb_worker_func(
             if elapsed_time > 0:
                 run.log(
                     {
-                        "fps": frames / elapsed_time,
                         "vps": videos / elapsed_time,
                         "tps": tars / elapsed_time,
                     },
@@ -800,7 +724,7 @@ def wandb_worker_func(
                 )
 
             logger.info(
-                f"WANDB: total stats - runtime: {convert_unix_timestamp(elapsed_time)} - {videos} videos, {frames} frames, {round(hours, 3)} hours, {tars} tars, {round(frames / elapsed_time, 2)} fps, {round(videos / elapsed_time, 3)} vps, {round(tars / elapsed_time, 3)} tps"
+                f"WANDB: total stats - runtime: {convert_unix_timestamp(elapsed_time)} - {videos} videos, {round(videos / elapsed_time, 3)} vps, {round(tars / elapsed_time, 3)} tps"
                 )
         except Exception as e:
             logger.error(f"WANDB: ERROR - {video_id} - {e}")

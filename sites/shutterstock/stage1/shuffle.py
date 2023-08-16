@@ -4,7 +4,7 @@ from tqdm import tqdm
 from sklearn.utils import shuffle
 
 # Establishing the connection
-conn = sqlite3.connect('/home/windowsuser/crawlers/sites/shutterstock/database.db')
+conn = sqlite3.connect('/home/windowsuser/crawlers/sites/shutterstock/stage2/database.db')
 
 # Creating a cursor
 cur = conn.cursor()

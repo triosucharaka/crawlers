@@ -12,25 +12,28 @@ import time
 import logging
 import tempfile
 import psutil
+from wrapt_timeout_decorator import *
 # config
-
-#TODO: apply this: https://stackoverflow.com/questions/21485319/high-memory-usage-using-python-multiprocessing max tasks per child, turn funcs into callables or something, just make it so that it restarts
 
 OPERATING_MODE = "process" # process, or thread
 
-SQL_READ_PATH = "/home/windowsuser/crawlers/sites/shutterstock/database.db"
-SQL_WRITE_PATH = "/home/windowsuser/crawlers/sites/shutterstock/dataset_map.db"
+SQL_READ_PATH = "database.db"
+SQL_WRITE_PATH = "dataset_map.db"
 SQL_MAX = 12500000 # 12.5m
 SQL_WRITE_CHECKPOINT = 2
 
 DOWNLOAD_WORKERS = 60
 DOWNLOAD_TIMEOUT = 10
 DOWNLOAD_RETRY_COUNT = 3
+DOWNLOAD_MTFC = 30
 
-DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage2"
+DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage2/videos"
+DISK_PATH_TXT = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage2/txtonly"
 TAR_WORKERS = 5
+TAR_INDIV_TIMEOUT = 30
+TAR_MTFC = 10
 
-MAX_VIDEO = 500000
+MAX_VIDEO = 100000
 
 # pipes limits
 SQL_PIPE_MAX = 4000
@@ -85,7 +88,7 @@ def sql_reader_func(sql_pipe: mp.Queue):
     row_count = 0
     while True:
         try:
-            logger.info(f"sql-r: reading: {row_count}")
+            #logger.info(f"sql-r: reading: {row_count}")
             row = cursor.fetchone()
             if row is None or row_count >= MAX_VIDEO:
                 sql_pipe.put(None)
@@ -95,7 +98,7 @@ def sql_reader_func(sql_pipe: mp.Queue):
             v_id, desc, dur, asr, v_url, auth, catg, fps, r18 = row 
 
             if not validate_aspect_ratio(asr):
-                logger.info(f"sql-r: invalid aspect ratio: {v_id}, {asr}")
+                #logger.info(f"sql-r: invalid aspect ratio: {v_id}, {asr}")
                 continue
 
             metadata = {
@@ -114,7 +117,7 @@ def sql_reader_func(sql_pipe: mp.Queue):
 
             row_count += 1
 
-            logger.info(f"sql-r: sent: {v_id}")
+            #logger.info(f"sql-r: sent: {v_id}")
         except Exception as e:
             traceback.print_exc()
             logger.info(f"sql-r: failed: {e}")
@@ -124,18 +127,26 @@ def sql_reader_func(sql_pipe: mp.Queue):
 
     sql_pipe.put(None)
 
-def download_worker_func(index: int, sql_pipe: mp.Queue, file_pipe: mp.Queue):
+def download_worker_func(index: int, sql_pipe: mp.Queue, file_pipe: mp.Queue,  keep_restarting: mp.Value):
     logger.info(f"downloader-{index}: started")
+
+    processed_tasks = 0
+
     while True:
         try:
-            logger.info(f"downloader-{index}: waiting for data")
+            if processed_tasks >= DOWNLOAD_MTFC:
+                logger.info(f"downloader-{index}: max tasks reached")
+                break
+
+            #logger.info(f"downloader-{index}: waiting for data")
             data = sql_pipe.get()
-            logger.info(f"downloader-{index}: got data")
+            #logger.info(f"downloader-{index}: got data")
             
             if data is None:
                 logger.info(f"downloader-{index}: got None")
                 sql_pipe.put(None)
                 file_pipe.put(None)
+                keep_restarting.value = 0
                 break
 
             video_url, metadata = data
@@ -146,7 +157,7 @@ def download_worker_func(index: int, sql_pipe: mp.Queue, file_pipe: mp.Queue):
                     if response.status_code != 200:
                         logger.info(f"downloader-{index}: failed: status code: {response.status_code}")
                         continue
-                    logger.info(f"downloader-{index}: downloaded")
+                    #logger.info(f"downloader-{index}: downloaded")
                     break
                 except Exception as e:
                     traceback.print_exc()
@@ -157,11 +168,34 @@ def download_worker_func(index: int, sql_pipe: mp.Queue, file_pipe: mp.Queue):
                 continue
             
             file_pipe.put((response.content, metadata))
-            logger.info(f"downloader-{index}: sent")
+            processed_tasks += 1
+            #logger.info(f"downloader-{index}: sent")
         except Exception as e:
             traceback.print_exc()
             logger.info(f"downloader-{index}: failed: {e}")
             continue
+
+def download_worker_manager(index: int, sql_pipe: mp.Queue, file_pipe: mp.Queue):
+    logger.info("downloader-m: started")
+    keep_restarting = mp.Value('i', 1)
+    while keep_restarting.value == 1:
+        try:
+            #logger.info("downloader-m: starting worker")
+            download_worker = mp.Process(
+                target=download_worker_func,
+                args=(index, sql_pipe, file_pipe, keep_restarting,),
+            )
+            #logger.info("downloader-m: worker created")
+            download_worker.start()
+            #logger.info("downloader-m: worker started")
+            download_worker.join()
+            #logger.info("downloader-m: worker joined")
+        except Exception as e:
+            logger.error(f"downloader-m: failed: {e}")
+            logger.error(traceback.format_exc())
+            continue
+    
+    logger.info("downloader-m: finished")
 
 def vid_extras(video_bytes: bytes):
     with tempfile.NamedTemporaryFile() as temp:
@@ -176,21 +210,46 @@ def vid_extras(video_bytes: bytes):
         del cap
     return height, width, fps, duration, frame_count
 
-def tar_worker_func(index: int, file_pipe: mp.Queue, meta_pipe: mp.Queue, tar_id: mp.Value, wandb_pipe: mp.Queue = None):
+def tar_worker_func(index: int, file_pipe: mp.Queue, meta_pipe: mp.Queue, tar_id: mp.Value, keep_restarting: mp.Value, wandb_pipe: mp.Queue = None):
+
+    @timeout(TAR_INDIV_TIMEOUT)
+    def add2tar_vid(files_tuple, tar):
+        video_id, video_bytes, metadata_as_bytes = files_tuple
+        tarinfo = tarfile.TarInfo(name=f"{video_id}.mp4")
+        tarinfo.size = len(video_bytes)
+        tar.addfile(tarinfo, io.BytesIO(video_bytes))
+        tarinfo = tarfile.TarInfo(name=f"{video_id}.json")
+        tarinfo.size = len(metadata_as_bytes)
+        tar.addfile(tarinfo, io.BytesIO(metadata_as_bytes))
+
+    @timeout(TAR_INDIV_TIMEOUT)
+    def add2tar_txt(files_tuple, tar):
+        video_id, _, metadata_as_bytes = files_tuple
+        tarinfo = tarfile.TarInfo(name=f"{video_id}.json")
+        tarinfo.size = len(metadata_as_bytes)
+        tar.addfile(tarinfo, io.BytesIO(metadata_as_bytes))
+
+    processed_tasks = 0
+
     meta_tar = list()
     files_tar = list()
     files_size = 0
     logger.info(f"tar-{index}: started")
     while True:
         try:
-            logger.info(f"tar-{index}: waiting for data")
+            if processed_tasks >= TAR_MTFC:
+                logger.info(f"tar-{index}: max tasks reached")
+                break
+
+            #logger.info(f"tar-{index}: waiting for data")
             data = file_pipe.get()
-            logger.info(f"tar-{index}: got data")
+            #logger.info(f"tar-{index}: got data")
 
             if data is None:
                 logger.info(f"tar-{index}: got None")
                 file_pipe.put(None)
                 meta_pipe.put(None)
+                keep_restarting.value = 0
                 if USE_WANDB:
                     wandb_pipe.put(None)
                 break
@@ -198,7 +257,7 @@ def tar_worker_func(index: int, file_pipe: mp.Queue, meta_pipe: mp.Queue, tar_id
             video_bytes, metadata = data
             video_id = metadata["id"]
 
-            logger.info(f"tar-{index}: added {video_id} to tar, size: {int(files_size/1024/1024)}/{int(TAR_BYTES/1024/1024)} MB")
+            #logger.info(f"tar-{index}: added {video_id} to tar, size: {int(files_size/1024/1024)}/{int(TAR_BYTES/1024/1024)} MB")
 
             try:
                 metadata['cv_height'], metadata['cv_width'], metadata['cv_fps'], metadata['cv_duration'], metadata['cv_frame_count'] = vid_extras(video_bytes)
@@ -227,19 +286,61 @@ def tar_worker_func(index: int, file_pipe: mp.Queue, meta_pipe: mp.Queue, tar_id
 
                 logger.info(f"tar-{index}: writing tar to disk")
 
+                success_files = 0
+                fail_files = 0
+
                 with tarfile.open(name=f"{DISK_PATH}/{tar_id_copy}.tar", mode="w") as tar:
-                    for video_id, video_bytes, metadata_as_bytes in files_tar:
-                        tarinfo = tarfile.TarInfo(name=f"{video_id}.mp4")
-                        tarinfo.size = len(video_bytes)
-                        tar.addfile(tarinfo, io.BytesIO(video_bytes))
-                        tarinfo = tarfile.TarInfo(name=f"{video_id}.json")
-                        tarinfo.size = len(metadata_as_bytes)
-                        tar.addfile(tarinfo, io.BytesIO(metadata_as_bytes))
+                    for files_tuple in files_tar:
+                        vid_id = files_tuple[0]
+                        try:
+                            add2tar_vid(files_tuple, tar)
+                            success_files += 1
+                            # logger.info(
+                            #     f"TAR/PROC-{index}: {vid_id} - successfully written to VIDEO tar"
+                            # )
+                        except TimeoutError:
+                            fail_files += 1
+                            logger.error(
+                                f"TAR/PROC-{index}: {vid_id} - ERROR - timeout while writing to VIDEO tar"
+                            )
+                            logger.error(traceback.format_exc())
+                            continue
+                        except Exception as e:
+                            fail_files += 1
+                            logger.error(
+                                f"TAR/PROC-{index}: {vid_id} - ERROR VIDEO - {e}"
+                            )
+                            logger.error(traceback.format_exc())
+                            continue
+
+                with tarfile.open(name=f"{DISK_PATH_TXT}/{tar_id_copy}.tar", mode="w") as tar:
+                    for files_tuple in files_tar:
+                        vid_id = files_tuple[0]
+                        try:
+                            add2tar_txt(files_tuple, tar)
+                            success_files += 1
+                            # logger.info(
+                            #     f"TAR/PROC-{index}: {vid_id} - successfully written to TEXT tar"
+                            # )
+                        except TimeoutError:
+                            fail_files += 1
+                            logger.error(
+                                f"TAR/PROC-{index}: {vid_id} - ERROR - timeout while writing to TEXT tar"
+                            )
+                            logger.error(traceback.format_exc())
+                            continue
+                        except Exception as e:
+                            fail_files += 1
+                            logger.error(
+                                f"TAR/PROC-{index}: {vid_id} - ERROR TEXT - {e}"
+                            )
+                            logger.error(traceback.format_exc())
+                            continue
 
                 files_tar = list()
                 files_size = 0
 
-                logger.info(f"tar-{index}: wrote tar to disk")
+                #logger.info(f"tar-{index}: wrote tar to disk")
 
                 if USE_WANDB:
                     wandb_pipe.put({"type": "tar_entry", "data": tar_id_copy})
@@ -248,11 +349,37 @@ def tar_worker_func(index: int, file_pipe: mp.Queue, meta_pipe: mp.Queue, tar_id
 
                 logger.info(f"tar-{index}: created new tar with id {tar_id_copy}, and {len(meta_tar)} videos")
 
+                processed_tasks += 1
+
                 meta_tar = list()
         except Exception as e:
             traceback.print_exc()
             logger.info(f"tar-{index}: failed: {e}")
             continue
+
+def tar_worker_manager(index: int, file_pipe: mp.Queue, meta_pipe: mp.Queue, tar_id: mp.Value, wandb_pipe: mp.Queue = None):
+    logger.info(f"tar-manager-{index}: started")
+
+    keep_restarting = mp.Value('i', 1)
+
+    while keep_restarting.value == 1:
+        try:
+            logger.info(f"tar-manager-{index}: starting tar worker")
+            tar_worker = mp.Process(
+                target=tar_worker_func,
+                args=(index, file_pipe, meta_pipe, tar_id, keep_restarting, wandb_pipe,),
+            )
+            logger.info(f"tar-manager-{index}: worker created")
+            tar_worker.start()
+            logger.info(f"tar-manager-{index}: worker started")
+            tar_worker.join()
+            logger.info(f"tar-manager-{index}: worker joined")
+        except Exception as e:
+            logger.error(f"tar-manager-{index}: worker failed: {e}")
+            logger.error(traceback.format_exc())
+            continue
+
+    logger.info(f"tar-manager-{index}: exiting")
 
 def wandb_worker_func(wandb_pipe: mp.Queue):
     run = wandb.init(project=WANDB_PROJ, entity=WANDB_ENTITY)
@@ -369,13 +496,13 @@ def main():
 
     logger.info("started sql_reader")
 
-    download_threads = [spawner(target=download_worker_func, args=(i, sql_pipe, file_pipe,)) for i in range(DOWNLOAD_WORKERS)]
+    download_threads = [spawner(target=download_worker_manager, args=(i, sql_pipe, file_pipe,)) for i in range(DOWNLOAD_WORKERS)]
     for thread in download_threads:
         thread.start()
 
     logger.info("started download_workers")
 
-    tar_threads = [spawner(target=tar_worker_func, args=(i, file_pipe, meta_pipe, tar_id, wandb_pipe,)) for i in range(TAR_WORKERS)]
+    tar_threads = [spawner(target=tar_worker_manager, args=(i, file_pipe, meta_pipe, tar_id, wandb_pipe,)) for i in range(TAR_WORKERS)]
     for thread in tar_threads:
         thread.start()
 

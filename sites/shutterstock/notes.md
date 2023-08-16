@@ -6,6 +6,15 @@
 - Stage 4: Frame Encoding (VAE/AutoencoderKL)
 - Stage 5: Caption Encoding (CLIPTextModel/clip-vit-large-patch14)
 
+Stage 4/5 uses pure JAX, while Stage 3 uses Pytorch XLA.
+
+# TODO:
+
+1. Add new parts from stage 4 into stage 3:
+* Tar spawn and manager system
+* Tar writing timeout
+* WANDB/Logger spawn on everything
+
 ### SQL DB download for stage 2
 
 SQL DB download path (authenticated):
