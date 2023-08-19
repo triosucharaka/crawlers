@@ -25,7 +25,7 @@ INSTANCE = 0
 ## Paths
 IN_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage2/"
 OUT_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage3/"
-JSON_MAP_PATH = "/home/windowsuser/crawlers/sites/shutterstock/stage2/map.json"
+JSON_MAP_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/global/raw_map.json"
 
 ## Wandb
 global USE_WANDB
