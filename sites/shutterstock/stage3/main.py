@@ -594,6 +594,7 @@ def wandb_worker_func(
         return time.strftime("%H:%M:%S")
     
     run_config = {
+        "TOTAL_VIDEOS": len(json.load(open(JSON_MAP_PATH, "r"))[str(INSTANCE)]),
         "IN_DISK_PATH": IN_DISK_PATH,
         "OUT_DISK_PATH": OUT_DISK_PATH,
         "JSON_MAP_PATH": JSON_MAP_PATH,
