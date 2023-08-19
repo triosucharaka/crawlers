@@ -10,10 +10,10 @@ from datasets import load_dataset
 ### Configuration ###
 
 # General
-MAX_ENTRIES = 100000000
+MAX_ENTRIES = 10000000
 
 # SQL
-SQLDB_PATH = "/home/windowsuser/mount-folder/tempofunkds/laion_wide/database/map.db"
+SQLDB_PATH = "map.db"
 SQLDB_SAVE_BATCH_SIZE = 100000
 
 # HuggingFace Datasets
