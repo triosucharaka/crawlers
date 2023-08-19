@@ -14,13 +14,18 @@ import psutil
 import cv2
 import threading
 import traceback
+import argparse
 from im2im.main import load_model
 
 mp.set_start_method("spawn", force=True)
 
-### Configuration ###
+# get instance id from args
+parser = argparse.ArgumentParser()
+parser.add_argument("--instance", type=int, required=True)
+args = parser.parse_args()
+INSTANCE = args.instance
 
-INSTANCE = 0
+### Configuration ###
 
 ## Paths
 IN_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage2/"
