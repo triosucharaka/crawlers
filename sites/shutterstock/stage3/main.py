@@ -7,45 +7,39 @@ import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_multiprocessing as xmp
 import torch
 import numpy as np
-import io
 import tempfile
-import tarfile
 import gc
-import webdataset as wds
 import logging
 import psutil
 import cv2
 import threading
 import traceback
-import os
 from im2im.main import load_model
-from wrapt_timeout_decorator import *
 
 mp.set_start_method("spawn", force=True)
 
 ### Configuration ###
 
+INSTANCE = 0
+
 ## Paths
-IN_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage2/videos/"
-OUT_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage3/0/"
-JSON_MAP_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/nano/output1.json"
-JSON_READ_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/nano/stage2_instance1.json"
+IN_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage2/"
+OUT_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage3/"
+JSON_MAP_PATH = "/home/windowsuser/crawlers/sites/shutterstock/stage2/map.json"
 
 ## Wandb
 global USE_WANDB
 USE_WANDB = True
 WANDB_ENTITY = "peruano"  # none if not using wandb
-WANDB_PROJ = "shutterstock_stage3"
-WANDB_NAME = f"stage3_instace1_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
+WANDB_PROJ = "debug_shutterstock_stage3"
+WANDB_NAME = f"stage3_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
 LOG_MEMORY = True
 
 ## Multiprocessing
 ASSIGN_WORKER_COUNT = 4
 ASSIGN_WORKER_MAX_TASKS_PER_CHILD = 10
-TAR_WORKER_COUNT = 8
-TAR_SIZE = 512 * 1024 * 1024  # 512MB
-TAR_INDIV_TIMEOUT = 15 # seconds
-TAR_WORKER_MAX_TASKS_PER_CHILD = 5
+TAR_WORKER_COUNT = 4
+TAR_MTPC = 40
 
 ## TPU Workers
 TPU_CORE_COUNT = 4
@@ -95,41 +89,24 @@ if LOG_MEMORY:
 
 def wds_reader_func(file_pipe: mp.Queue):
     logger.info("WDS: started")
-    json_map = json.load(open(JSON_MAP_PATH, "r"))
-    if os.path.exists(JSON_READ_PATH):
-        json_read = json.load(open(JSON_READ_PATH, "r"))
-    else:
-        json_read = list()
-    tar_map = list()
-    read_tars = list()
-
-    for entry in json_read:
-        read_tars.append(entry["tar"])
-        if entry in json_map:
-            json_map.remove(entry)
-
-    for tar in json_map:
-        tar_map.append(IN_DISK_PATH + tar)
-
-    dataset = wds.WebDataset(tar_map)
-
-    for sample in dataset:
+    json_map = json.load(open(JSON_MAP_PATH, "r"))[str(INSTANCE)]
+    
+    for fileid in json_map:
         try:
-            logger.info(f"WDS: sending {sample['__key__']}")
-            file_pipe.put((sample["__key__"], sample["mp4"], sample["json"]))
+            logger.info(f"WDS: sending {fileid}")
+
+            mp4_bytes = open(f"{IN_DISK_PATH}/{fileid}.mp4", "rb").read()
+
+            json_bytes = open(f"{IN_DISK_PATH}/{fileid}.json", "rb").read()
+
+            file_pipe.put((fileid, mp4_bytes, json_bytes))
         except Exception as e:
-            logger.error(f"WDS: {sample['__key__']} ERROR - {e}")
+            logger.error(f"WDS: {fileid} ERROR - {e}")
             logger.error(traceback.format_exc())
             continue
-        finally:
-            tar_filename = sample["__url__"].split("/")[-1]
-            if tar_filename not in read_tars:
-                read_tars.append(tar_filename)
-                json.dump(read_tars, open(JSON_READ_PATH, "w"))
 
     file_pipe.put((None, None, None))
     logger.info("WDS: finished")
-
 
 def tpu_worker_func(
     index, in_data_pipe: mp.Queue, out_data_pipe: mp.Queue, tmp_c: mp.Value
@@ -265,7 +242,7 @@ def assign_worker_func(
 
     vid_id = None
 
-    def save_video_func(fps, final_out, metadata, vid_id):
+    def send_video_func(fps, final_out, metadata, vid_id):
         logger.info(f"ASSIGN/ASYNC-{index}: {vid_id} - I have been summoned")
         # final out is the tensor
         with tempfile.NamedTemporaryFile(suffix=".mp4") as temp:
@@ -307,12 +284,12 @@ def assign_worker_func(
         tar_pipe.put((vid_id, final_out, metadata_bytes, metadata))  # str, bytes, bytes
         logger.info(f"ASSIGN/ASYNC-{index}: {vid_id} - sent to tar worker")
 
-    def save_video(fps, final_out, metadata, vid_id):
-        task_thead = threading.Thread(
-            target=save_video_func, args=(fps, final_out, metadata, vid_id)
+    def send_video(fps, final_out, metadata, vid_id):
+        task_thread = threading.Thread(
+            target=send_video_func, args=(fps, final_out, metadata, vid_id)
         )
-        task_thead.start()
-        tasks.append(task_thead)
+        task_thread.start()
+        return task_thread
 
     while True:
         try:
@@ -464,9 +441,10 @@ def assign_worker_func(
                 f"ASSIGN/PROC-{index}: {vid_id} - final output shape {final_out.shape}, writing video..."
             )
 
-            save_video(fps, final_out, metadata, vid_id)
+            _task = send_video(fps, final_out, metadata, vid_id)
+            tasks.append(_task)
 
-            logger.info(f"ASSIGN/PROC-{index}: {vid_id} - called save_video (Async)")
+            logger.info(f"ASSIGN/PROC-{index}: {vid_id} - called send_video (Async)")
 
             gc_obj += gc.collect()
             logger.info(f"ASSIGN/PROC-{index}: {vid_id} - done, {gc_obj} objects collected")
@@ -499,7 +477,6 @@ def assign_worker_manager(
 
     while keep_restarting.value == 1:
         try:
-            logger.info(f"ASSIGN/MANAGER-{index}: starting worker")
             child_process = mp.Process(
                 target=assign_worker_func,
                 args=(
@@ -511,64 +488,56 @@ def assign_worker_manager(
                     keep_restarting,
                 ),
             )
-            logger.info(f"ASSIGN/MANAGER-{index}: worker started")
             child_process.start()
-            logger.info(f"ASSIGN/MANAGER-{index}: worker joined")
             child_process.join()
             gc.collect()
-            logger.info(f"ASSIGN/MANAGER-{index}: worker exited")
         except Exception as e:
             logger.error(f"ASSIGN/MANAGER-{index}: ERROR - {e}")
             logger.error(traceback.format_exc())
             continue
-
     logger.info(f"ASSIGN/MANAGER-{index}: exiting")
 
-
 def tar_worker_func(
-    index: int, tar_pipe: mp.Queue, wandb_pipe: mp.Queue, tar_id: mp.Value
+    index: int, tar_pipe: mp.Queue, wandb_pipe: mp.Queue, keep_restarting: mp.Value
 ):
-    processed_tasks = 0
-
-    @timeout(TAR_INDIV_TIMEOUT)
-    def add2tar(files_tuple, tar):
-        vid_id, vid_bytes, meta_bytes = files_tuple
-        logger.info(f"TAR-{index}: {vid_id} - writing to tar")
-        tarinfo = tarfile.TarInfo(name=f"{vid_id}.mp4")
-        tarinfo.size = len(vid_bytes)
-        tar.addfile(tarinfo, io.BytesIO(vid_bytes))
-        logger.info(f"TAR-{index}: {vid_id} - mp4 written to tar")
-        tarinfo = tarfile.TarInfo(name=f"{vid_id}.json")
-        tarinfo.size = len(meta_bytes)
-        tar.addfile(tarinfo, io.BytesIO(meta_bytes))
-        logger.info(f"TAR-{index}: {vid_id} - meta written to tar")
-
-    files_tar = list()
-    files_size = 0
     vid_id = None # for error handling without pipe.get
+    processed_tasks = 0
+    tasks = list()
 
     logger.info(f"TAR-{index}: started")
 
-    while True:
-        try:
-            if processed_tasks >= TAR_WORKER_MAX_TASKS_PER_CHILD:
-                logger.info(
-                    f"TAR/PROC-{index}: processed {processed_tasks} tasks (max tasks per child), restarting"
-                )
-                break
+    def save_video_func(vid_id, vid_bytes, meta_bytes):
+        logger.info(f"TAR-{index}: saving video {vid_id}")
+        with open(f"{OUT_DISK_PATH}/{vid_id}.mp4", "wb") as f:
+            f.write(vid_bytes)
+        with open(f"{OUT_DISK_PATH}/{vid_id}.json", "wb") as f:
+            f.write(meta_bytes)
+        logger.info(f"TAR-{index}: saved video {vid_id}")
 
+    def save_video(vid_id, vid_bytes, meta_bytes):
+        task_thead = threading.Thread(
+            target=save_video_func, args=(vid_id, vid_bytes, meta_bytes,)
+        )
+        task_thead.start()
+        return task_thead
+
+    while processed_tasks <= TAR_MTPC:
+        try:
             logger.info(f"TAR-{index}: waiting for data")
             vid_id, vid_bytes, meta_bytes, meta = tar_pipe.get()
             logger.info(f"TAR-{index}: got data")
 
             if all(x is None for x in [vid_id, vid_bytes, meta_bytes, meta]):
                 logger.info(f"TAR-{index}: got None, exiting")
+                keep_restarting.value = 0
                 if USE_WANDB:
                     wandb_pipe.put(None)
                 break
 
-            files_tar.append((vid_id, vid_bytes, meta_bytes))
-            files_size += len(vid_bytes) + len(meta_bytes)
+            logger.info(f"TAR-{index}: {vid_id} - saving video")
+            _task = save_video(vid_id, vid_bytes, meta_bytes)
+            tasks.append(_task)
+
             if USE_WANDB:
                 wandb_pipe.put(
                     {
@@ -582,91 +551,32 @@ def tar_worker_func(
                     }
                 )
 
-            logger.info(
-                f"TAR-{index}: {vid_id} - added to tar, size {files_size/1024/1024} MB"
-            )
-
-            if files_size > TAR_SIZE:
-                with tar_id.get_lock():
-                    tar_id.value += 1
-                    tar_id_val = tar_id.value
-                logger.info(
-                    f"TAR-{index}: {tar_id_val} - tar size exceeded, writing to disk"
-                )
-
-                tar_id_val = str(tar_id_val).zfill(6)
-
-                # make sure we dont use the ones from current itteration
-                del vid_id, vid_bytes, meta_bytes, meta
-
-                success_files = 0
-                fail_files = 0
-
-                with tarfile.open(
-                    name=f"{OUT_DISK_PATH}/{tar_id_val}.tar", mode="w"
-                ) as tar:
-                    for files_tuple in files_tar:
-                        vid_id = files_tuple[0]
-                        try:
-                            add2tar(files_tuple, tar)
-                            success_files += 1
-                            logger.info(
-                                f"TAR/PROC-{index}: {vid_id} - successfully written to tar"
-                            )
-                        except TimeoutError:
-                            fail_files += 1
-                            logger.error(
-                                f"TAR/PROC-{index}: {vid_id} - ERROR - timeout while writing to tar"
-                            )
-                            logger.error(traceback.format_exc())
-                            continue
-                        except Exception as e:
-                            fail_files += 1
-                            logger.error(
-                                f"TAR/PROC-{index}: {vid_id} - ERROR - {e}"
-                            )
-                            logger.error(traceback.format_exc())
-                            continue
-                files_tar = list()
-                files_size = 0
-
-                processed_tasks += 1
-
-                logger.info(f"TAR/PROC-{index}: {tar_id_val} - tar written to disk, with {success_files} files, and {fail_files} failutes, total processed tasks {processed_tasks}")
-
-                if USE_WANDB:
-                    wandb_pipe.put({"type": "tar_entry", "data": None})
         except Exception as e:
             logger.error(f"TAR-{index}: {vid_id} - ERROR - {e}")
             logger.error(traceback.format_exc())
             continue
 
-def tar_worker_manager(
-    index: int, tar_pipe: mp.Queue, wandb_pipe: mp.Queue, tar_id: mp.Value
-):
-    logger.info(f"TAR/MANAGER-{index}: started")
+    logger.info(f"TAR-{index}: waiting for async tasks to finish")
+    for task in tasks:
+        task.join()
+
+def tar_manager_func(index: int, tar_pipe: mp.Queue, wandb_pipe: mp.Queue):
 
     keep_restarting = mp.Value("i", 1)
 
     while keep_restarting.value == 1:
         try:
-            logger.info(f"TAR/MANAGER-{index}: starting worker")
-            tar_worker = mp.Process(
+            child_process = mp.Process(
                 target=tar_worker_func,
-                args=(index, tar_pipe, wandb_pipe, tar_id, keep_restarting,),
+                args=(index, tar_pipe, wandb_pipe, keep_restarting,),
             )
-            logger.info(f"TAR/MANAGER-{index}: worker created")
-            tar_worker.start()
-            logger.info(f"TAR/MANAGER-{index}: worker started")
-            tar_worker.join()
+            child_process.start()
+            child_process.join()
             gc.collect()
-            logger.info(f"TAR/MANAGER-{index}: worker exited/joined")
         except Exception as e:
             logger.error(f"TAR/MANAGER-{index}: ERROR - {e}")
             logger.error(traceback.format_exc())
             continue
-
-    logger.info(f"TAR/MANAGER-{index}: exiting")
 
 def wandb_worker_func(
     wandb_pipe: mp.Queue,
@@ -691,7 +601,6 @@ def wandb_worker_func(
         "ASSIGN_WORKER_COUNT": ASSIGN_WORKER_COUNT,
         "ASSIGN_WORKER_MAX_TASKS_PER_CHILD": ASSIGN_WORKER_MAX_TASKS_PER_CHILD,
         "TAR_WORKER_COUNT": TAR_WORKER_COUNT,
-        "TAR_SIZE": TAR_SIZE,
         "TPU_CORE_COUNT": TPU_CORE_COUNT,
         "TPU_BATCH_SIZE": TPU_BATCH_SIZE,
         "MAX_SUPERBATCHES": MAX_SUPERBATCHES,
@@ -717,7 +626,6 @@ def wandb_worker_func(
     frames = 0
     hours = 0
     videos = 0
-    tars = 0
 
     video_id = None
 
@@ -753,23 +661,18 @@ def wandb_worker_func(
                     {"videos": videos, "frames": frames, "hours": hours}, step=elapsed_time
                 )
 
-            elif data["type"] == "tar_entry":
-                tars += 1
-                run.log({"tars": tars}, step=elapsed_time)
-
             # speed report
             if elapsed_time > 0:
                 run.log(
                     {
                         "fps": frames / elapsed_time,
                         "vps": videos / elapsed_time,
-                        "tps": tars / elapsed_time,
                     },
                     step=elapsed_time,
                 )
 
             logger.info(
-                f"WANDB: total stats - runtime: {convert_unix_timestamp(elapsed_time)} - {videos} videos, {frames} frames, {round(hours, 3)} hours, {tars} tars, {round(frames / elapsed_time, 2)} fps, {round(videos / elapsed_time, 3)} vps, {round(tars / elapsed_time, 3)} tps"
+                f"WANDB: total stats - runtime: {convert_unix_timestamp(elapsed_time)} - {videos} videos, {frames} frames, {round(hours, 3)} hours, {round(frames / elapsed_time, 2)} fps, {round(videos / elapsed_time, 3)} vps"
                 )
         except Exception as e:
             logger.error(f"WANDB: ERROR - {video_id} - {e}")
@@ -859,12 +762,11 @@ if __name__ == "__main__":
     tar_worker_processes = list()
     for i in range(TAR_WORKER_COUNT):
         tar_worker_process = mp.Process(
-            target=tar_worker_func,
+            target=tar_manager_func,
             args=(
                 i,
                 tar_pipe,
                 wandb_pipe,
-                tar_id,
             ),
         )
         tar_worker_processes.append(tar_worker_process)
