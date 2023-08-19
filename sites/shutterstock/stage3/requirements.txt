@@ -1,3 +1,4 @@
 tqdm
 wandb
 opencv-python
+pillow
