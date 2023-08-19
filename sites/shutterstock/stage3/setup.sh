@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# No input
+export DEBIAN_FRONTEND=noninteractive
+
 # Package updates and installations
 sudo apt update && sudo apt install ffmpeg libsm6 libxext6 screen wget nano git-lfs -y
 
