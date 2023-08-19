@@ -31,7 +31,7 @@ JSON_MAP_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/global/
 global USE_WANDB
 USE_WANDB = True
 WANDB_ENTITY = "peruano"  # none if not using wandb
-WANDB_PROJ = "debug_shutterstock_stage3"
+WANDB_PROJ = "100k_shutterstock_stage3"
 WANDB_NAME = f"stage3_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
 LOG_MEMORY = True
 
