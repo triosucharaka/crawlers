@@ -616,7 +616,7 @@ def tar_worker_manager(
         try:
             tar_worker = mp.Process(
                 target=tar_worker_func,
-                args=(index, tar_pipe, wandb_pipe, tar_id, keep_restarting,),
+                args=(index, tar_pipe, wandb_pipe, keep_restarting,),
             )
             tar_worker.start()
             tar_worker.join()

@@ -1,0 +1,6 @@
+diffusers
+wandb
+psutil
+opencv-python
+wrapt_timeout_decorator
+flax
