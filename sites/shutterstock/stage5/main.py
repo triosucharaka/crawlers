@@ -5,13 +5,11 @@ import wandb
 import os
 import numpy as np
 import io
-import tempfile
 import tarfile
 import gc
-import webdataset as wds
 import logging
 import psutil
-import cv2
+import argparse
 import threading
 import traceback
 import jax.numpy as jnp
@@ -22,13 +20,18 @@ from wrapt_timeout_decorator import *
 
 mp.set_start_method("spawn", force=True)
 
+# get instance id from args
+parser = argparse.ArgumentParser()
+parser.add_argument("--instance", type=int, required=True)
+args = parser.parse_args()
+INSTANCE = args.instance
+
 ### Configuration ###
 
 ## Paths
-IN_DISK_PATH = "internetoverdose/tempofunkds/shutterstock/stage4/"
-OUT_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage5/"
-JSON_MAP_PATH = "map.json"
-JSON_READ_PATH = "stage5_read.json"
+IN_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage3/"
+OUT_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage4/"
+JSON_MAP_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/global/dewatermarked_map.json"
 
 NPY_EXTENSION = "cliptext" # ex.: 00001.cliptext (not .npy, to differentiate with the text embeds on stage 5)
 
