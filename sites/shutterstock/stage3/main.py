@@ -21,48 +21,51 @@ mp.set_start_method("spawn", force=True)
 
 # get instance id from args
 parser = argparse.ArgumentParser()
-parser.add_argument("--instance", type=int, required=True)
+parser.add_argument("--config", type=str, required=True)
 args = parser.parse_args()
-INSTANCE = args.instance
+CONFIGURATION_PATH = args.config
+config = json.load(open(CONFIGURATION_PATH, "r"))
 
 ### Configuration ###
 
+INSTANCE = config['instance'] #0
+
 ## Paths
-IN_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage2/"
-OUT_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage3/"
-JSON_MAP_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/global/raw_map.json"
+IN_DISK_PATH = config['paths']['in'] #"/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage2/"
+OUT_DISK_PATH = config['paths']['out'] #"/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage3/"
+JSON_MAP_PATH = config['paths']['json'] #"/home/windowsuser/mount-folder/tempofunkds/shutterstock/global/raw_map.json"
 
 ## Wandb
 global USE_WANDB
-USE_WANDB = True
-WANDB_ENTITY = "peruano"  # none if not using wandb
-WANDB_PROJ = "100k_shutterstock_stage3"
-WANDB_NAME = f"stage3_instance{INSTANCE}_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
-LOG_MEMORY = True
+USE_WANDB = config['wandb']['enable']
+WANDB_ENTITY = config['wandb']['entity'] #"tempofunk"
+WANDB_PROJ = config['wandb']['project'] #"shutterstock"
+WANDB_NAME = f"{config['wandb']['name']}_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
+LOG_MEMORY = config['wandb']['log_memory']
 
 ## Multiprocessing
-ASSIGN_WORKER_COUNT = 4
-ASSIGN_WORKER_MAX_TASKS_PER_CHILD = 10
-TAR_WORKER_COUNT = 4
-TAR_MTPC = 40
+ASSIGN_WORKER_COUNT = config['multiprocessing']['assign_worker_count'] #4
+ASSIGN_MTPC = config['multiprocessing']['assign_worker_mtpc'] #10
+TAR_WORKER_COUNT = config['multiprocessing']['tar_worker_count'] #4
+TAR_MTPC = config['multiprocessing']['tar_worker_mtpc'] #40
 
 ## TPU Workers
-TPU_CORE_COUNT = 4
-TPU_BATCH_SIZE = 64
-MAX_SUPERBATCHES = 60
+TPU_CORE_COUNT = config['tpu']['core_count'] #4
+TPU_BATCH_SIZE = config['tpu']['batch_size'] #64
+MAX_SUPERBATCHES = config['tpu']['max_superbatches'] #60
 
 ## Model Parameters
-IM2IM_MODEL_PATH = "im2im-sswm"
-C_C = 3
-C_H = 384  # (divisible by 64)
-C_W = 640  # (divisible by 64)
+IM2IM_MODEL_PATH = config['model']['path'] #"im2im-swmm
+C_C = config['model']['c_c'] #3
+C_H = config['model']['c_h'] #384  # (divisible by 64)
+C_W = config['model']['c_w'] #640  # (divisible by 64)
 
 ## Pipes
-FILE_PIPE_MAX = 100
-IN_DATA_PIPE_MAX = 400
-OUT_DATA_PIPE_MAX = 400
-TAR_PIPE_MAX = 200
-WANDB_PIPE_MAX = 1000
+FILE_PIPE_MAX = config['pipes']['file_pipe_max'] #100
+IN_DATA_PIPE_MAX = config['pipes']['in_data_pipe_max'] #400
+OUT_DATA_PIPE_MAX = config['pipes']['out_data_pipe_max'] #400
+TAR_PIPE_MAX = config['pipes']['tar_pipe_max'] #200
+WANDB_PIPE_MAX = config['pipes']['wandb_pipe_max'] #1000
 
 ### End Configuration ###
 
@@ -298,7 +301,7 @@ def assign_worker_func(
 
     while True:
         try:
-            if processed_tasks >= ASSIGN_WORKER_MAX_TASKS_PER_CHILD:
+            if processed_tasks >= ASSIGN_MTPC:
                 logger.info(
                     f"ASSIGN/PROC-{index}: processed {processed_tasks} tasks (max tasks per child), restarting"
                 )
@@ -605,7 +608,7 @@ def wandb_worker_func(
         "JSON_MAP_PATH": JSON_MAP_PATH,
         "LOG_MEMORY": LOG_MEMORY,
         "ASSIGN_WORKER_COUNT": ASSIGN_WORKER_COUNT,
-        "ASSIGN_WORKER_MAX_TASKS_PER_CHILD": ASSIGN_WORKER_MAX_TASKS_PER_CHILD,
+        "ASSIGN_WORKER_MAX_TASKS_PER_CHILD": ASSIGN_MTPC,
         "TAR_WORKER_COUNT": TAR_WORKER_COUNT,
         "TPU_CORE_COUNT": TPU_CORE_COUNT,
         "TPU_BATCH_SIZE": TPU_BATCH_SIZE,
