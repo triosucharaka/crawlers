@@ -17,59 +17,64 @@ import numpy as np
 import jax
 import argparse
 from diffusers import FlaxAutoencoderKL
+from diffusers.models.vae_flax import FlaxAutoencoderKLOutput
 from wrapt_timeout_decorator import *
 
 mp.set_start_method("spawn", force=True)
 
 # get instance id from args
 parser = argparse.ArgumentParser()
-parser.add_argument("--instance", type=int, required=True)
+parser.add_argument("--config", type=str, required=True)
 args = parser.parse_args()
-INSTANCE = args.instance
+CONFIGURATION_PATH = args.config
+config = json.load(open(CONFIGURATION_PATH, "r"))
 
 ### Configuration ###
 
-## Paths
-IN_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage3/"
-OUT_DISK_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage4/"
-JSON_MAP_PATH = "/home/windowsuser/mount-folder/tempofunkds/shutterstock/global/dewatermarked_map.json"
+INSTANCE = config['instance'] #0
 
-NPY_EXTENSION = "frames" # ex.: 00001.frames (not .npy, to differentiate with the text embeds on stage 5)
+## Paths
+IN_DISK_PATH = config['paths']['in']
+OUT_DISK_PATH = config['paths']['out']
+JSON_MAP_PATH = config['paths']['json']
+
+MEAN_EXTENSION = config['extensions']['mean']
+STD_EXTENSION = config['extensions']['std']
 
 ## Wandb
 global USE_WANDB
-USE_WANDB = True
-WANDB_ENTITY = "peruano"  # none if not using wandb
-WANDB_PROJ = "debug_shutterstock_stage4"
-WANDB_NAME = f"stage4_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
-LOG_MEMORY = True
-SPAWN_ON_EVERYTHING = False # wandb only grabs the current process logger, not global one, and also logs everything thats printed such as errors
+USE_WANDB = config['wandb']['enable']
+WANDB_ENTITY = config['wandb']['entity']
+WANDB_PROJ = config['wandb']['project']
+WANDB_NAME = f"{config['wandb']['name']}_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
+LOG_MEMORY = config['wandb']['log_memory']
+SPAWN_ON_EVERYTHING = config['wandb']['spawn_on_everything'] # wandb only grabs the current process logger, not global one, and also logs everything thats printed such as errors
 
 ## Multiprocessing
-ASSIGN_WORKER_COUNT = 4
-ASSIGN_WORKER_MAX_TASKS_PER_CHILD = 10
-TAR_WORKER_COUNT = 4
-TAR_MTPC = 40
+ASSIGN_WORKER_COUNT = config['multiprocessing']['assign_worker_count']
+ASSIGN_WORKER_MAX_TASKS_PER_CHILD = config['multiprocessing']['assign_worker_mtpc']
+TAR_WORKER_COUNT = config['multiprocessing']['tar_worker_count']
+TAR_MTPC = config['multiprocessing']['tar_worker_mtpc']
 
 ## TPU Workers
-TPU_CORE_COUNT = 4
-TPU_BATCH_SIZE = 64
-MAX_SUPERBATCHES = 60
+TPU_CORE_COUNT = config['tpu']['core_count']
+TPU_BATCH_SIZE = config['tpu']['batch_size']
+MAX_SUPERBATCHES = config['tpu']['max_superbatches']
 
 ## Model Parameters
-VAE_MODEL_PATH = "CompVis/stable-diffusion-v1-4"
-VAE_MODEL_REVISION = "flax"
-VAE_MODEL_SUBFOLDER = "vae"
-C_C = 3
-C_H = 384  # (divisible by 64)
-C_W = 640  # (divisible by 64)
+VAE_MODEL_PATH = config['model']['path']
+VAE_MODEL_REVISION = config['model']['revision']
+VAE_MODEL_SUBFOLDER = config['model']['subfolder']
+C_C = config['model']['c_c'] #3
+C_H = config['model']['c_h'] #384  # (divisible by 64)
+C_W = config['model']['c_w'] #640  # (divisible by 64)
 
 ## Pipes
-FILE_PIPE_MAX = 100
-IN_DATA_PIPE_MAX = 400
-OUT_DATA_PIPE_MAX = 400
-TAR_PIPE_MAX = 200
-WANDB_PIPE_MAX = 1000
+FILE_PIPE_MAX = config['pipes']['file_pipe_max'] #100
+IN_DATA_PIPE_MAX = config['pipes']['in_data_pipe_max'] #400
+OUT_DATA_PIPE_MAX = config['pipes']['out_data_pipe_max'] #400
+TAR_PIPE_MAX = config['pipes']['tar_pipe_max'] #200
+WANDB_PIPE_MAX = config['pipes']['wandb_pipe_max'] #1000
 
 ### End Configuration ###
 
@@ -176,30 +181,42 @@ def tpu_worker_func(
         return batch
     
     def encode(img, rng, vae_params):
-        init_latent_dist = vae.apply({"params": vae_params}, img, method=vae.encode).latent_dist
-        latent_dist = init_latent_dist.sample(key=rng)
-        latent_dist = latent_dist.transpose((0, 3, 1, 2))
-        latent_dist = vae.config.scaling_factor * latent_dist
-        return latent_dist
+        init_value = vae.apply({"params": vae_params}, img, method=vae.encode)
+        init_latent_dist = init_value.latent_dist
+        out_mean = init_latent_dist.mean
+        out_std = init_latent_dist.std
+        out_mean = out_mean.transpose((0, 3, 1, 2))
+        out_std = out_std.transpose((0, 3, 1, 2))
+        # NOTE: lopho wants mean and std separately
+        # latent_dist = init_latent_dist.sample(key=rng)
+        # latent_dist = latent_dist.transpose((0, 3, 1, 2))
+        # latent_dist = vae.config.scaling_factor * latent_dist
+        return (out_mean, out_std)
     
     def create_key(seed=0):
         return jax.random.PRNGKey(seed)
     
     rng = create_key(0)
-    model = jax.pmap(encode, in_axes=(0, None, None))
+    model = jax.pmap(encode, in_axes=(0, None, None), out_axes=(0, 0))
 
     tasks = list()
 
     def put_batch_func(tensor, data_batch):
         try:
             logger.info(f"TPU-{index}/ASYNC: placing batch")
-            
-            output = np.array(tensor)
+
+            mean, std = tensor
+            mean = np.array(mean)
+            std = np.array(std)
 
             for i in range(TPU_CORE_COUNT):
                 out_data_pipe.put(
                     {
-                        "value": output[i],
+                        #"value": output[i],
+                        "value": {
+                            "mean": mean[i],
+                            "std": std[i],
+                        },
                         "meta": data_batch[i],
                     }
                 )
@@ -249,7 +266,8 @@ def tpu_worker_func(
 
             total_frames = value.shape[0] * value.shape[1]
 
-            output = model(value, rng, vae_params).block_until_ready()
+            x = model(value, rng, vae_params)
+            output = x[0].block_until_ready(), x[1].block_until_ready()
             modeling_time = time.time() - init_time - preparation_time
 
             if first_run:
@@ -288,30 +306,40 @@ def assign_worker_func(
 
     vid_id = None
 
-    def save_video_func(fps, final_out: np.array, metadata, vid_id):
+    def save_video_func(fps, final_out, metadata, vid_id):
+        mean, std = final_out
+
         logger.info(f"ASSIGN/ASYNC-{index}: {vid_id} - I have been summoned")
 
+        assert mean.shape == std.shape, f"{mean.shape} != {std.shape}"
+
         swap_meta = {
-            "np_frame_count": final_out.shape[0],
-            "np_height": final_out.shape[2], # axis 1 is latent channels (4)
-            "np_width": final_out.shape[3],
+            "np_frame_count": mean.shape[0],
+            "np_height": mean.shape[2], # axis 1 is latent channels (4)
+            "np_width": mean.shape[3],
         }
 
-        numpy_bytes = io.BytesIO()
-        np.save(numpy_bytes, final_out, allow_pickle=False)
-        numpy_bytes = numpy_bytes.getvalue()
+        mean_bytes = io.BytesIO()
+        std_bytes = io.BytesIO()
+
+        np.save(mean_bytes, mean, allow_pickle=False)
+        np.save(std_bytes, std, allow_pickle=False)
+
+        mean_bytes = mean_bytes.getvalue()
+        std_bytes = std_bytes.getvalue()
 
         metadata = {**metadata, **swap_meta}
 
         logger.info(
-            f"ASSIGN/ASYNC-{index}: {vid_id} - {NPY_EXTENSION} encoded, {len(numpy_bytes)/1024/1024} MB with {final_out.shape[0]} frames"
+            f"ASSIGN/ASYNC-{index}: {vid_id} - NPY encoded, {(len(mean_bytes) + len(std_bytes))/1024/1024} MB with {mean.shape[0]} frames"
         )
 
         metadata_bytes = json.dumps(metadata).encode("utf-8")  # json metadata bytes
-        tar_pipe.put((vid_id, numpy_bytes, metadata_bytes, metadata))  # str, bytes, bytes
+        tar_pipe.put((vid_id, (mean_bytes, std_bytes), metadata_bytes, metadata))  # str, bytes, bytes
         logger.info(f"ASSIGN/ASYNC-{index}: {vid_id} - sent to tar worker")
 
     def save_video(fps, final_out, metadata, vid_id):
+        #NOTE: final_out is now a tuple composed of (mean, std) tensors
         task_thead = threading.Thread(
             target=save_video_func, args=(fps, final_out, metadata, vid_id)
         )
@@ -466,16 +494,23 @@ def assign_worker_func(
             output_superbatch.sort(key=lambda x: x["o"])
             output_superbatch = [x["v"] for x in output_superbatch]
             logger.info(f"ASSIGN/PROC-{index}: {vid_id} - all batches received")
-            final_out = np.concatenate(output_superbatch, axis=0)
+
+            # split into std and mean
+            mean_superbatch = [x["mean"] for x in output_superbatch]
+            std_superbatch = [x["std"] for x in output_superbatch]
+
+            mean_out = np.concatenate(mean_superbatch, axis=0)
+            std_out = np.concatenate(std_superbatch, axis=0)
 
             expected_out_shape = (TPU_BATCH_SIZE * superbatch_count, 4, C_H/8, C_W/8)
-            assert final_out.shape == expected_out_shape
+            assert mean_out.shape == expected_out_shape, f"{mean_out.shape} != {expected_out_shape}"
+            assert std_out.shape == expected_out_shape, f"{std_out.shape} != {expected_out_shape}"
 
             logger.info(
-                f"ASSIGN/PROC-{index}: {vid_id} - final output shape {final_out.shape}, writing numpy..."
+                f"ASSIGN/PROC-{index}: {vid_id} - stdout shape {mean_out.shape} & meanout shape{std_out.shape}, writing numpy..."
             )
 
-            save_video(fps, final_out, metadata, vid_id)
+            save_video(fps, (mean_out, std_out), metadata, vid_id)
 
             logger.info(f"ASSIGN/PROC-{index}: {vid_id} - called save_video (Async)")
 
@@ -549,9 +584,13 @@ def tar_worker_func(
     logger.info(f"TAR-{index}: started")
 
     def save_video_func(vid_id, npy_bytes, meta_bytes):
+        # NOTE: npy_bytes is now a tuple composed of (mean_bytes, std_bytes)
         logger.info(f"TAR-{index}: saving video {vid_id}")
-        with open(f"{OUT_DISK_PATH}/{vid_id}.{NPY_EXTENSION}", "wb") as f:
-            f.write(npy_bytes)
+        mean_bytes, std_bytes = npy_bytes
+        with open(f"{OUT_DISK_PATH}/{vid_id}.{MEAN_EXTENSION}", "wb") as f:
+            f.write(mean_bytes)
+        with open(f"{OUT_DISK_PATH}/{vid_id}.{STD_EXTENSION}", "wb") as f:
+            f.write(std_bytes)
         with open(f"{OUT_DISK_PATH}/{vid_id}.json", "wb") as f:
             f.write(meta_bytes)
         logger.info(f"TAR-{index}: saved video {vid_id}")

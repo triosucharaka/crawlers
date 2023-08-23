@@ -361,7 +361,7 @@ def assign_worker_func(
                     if not ret:
                         break
                     resized_frame = cv2.resize(
-                        cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), (C_W, C_H)
+                        cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), (C_W, C_H), interpolation=cv2.INTER_LANCZOS4
                     )
                     numpy_frame = np.array(resized_frame)
                     resized_frames.append(numpy_frame)
