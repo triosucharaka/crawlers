@@ -7,8 +7,8 @@ export DEBIAN_FRONTEND=noninteractive
 sudo apt update && sudo apt install ffmpeg libsm6 libxext6 screen wget nano git-lfs -y
 
 # Install specific Python packages
-pip install torch~=2.0.0 https://storage.googleapis.com/tpu-pytorch/wheels/tpuvm/torch_xla-2.0-cp38-cp38-linux_x86_64.whl
-pip -r requirements.txt
+python3 -m pip install torch~=2.0.0 https://storage.googleapis.com/tpu-pytorch/wheels/tpuvm/torch_xla-2.0-cp38-cp38-linux_x86_64.whl
+python3 -m pip install -r requirements.txt
 
 # Set up git Large File Storage (LFS) and clone the repos
 git lfs install
