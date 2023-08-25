@@ -15,6 +15,7 @@ import cv2
 import threading
 import traceback
 import argparse
+import os
 from im2im.main import load_model
 
 mp.set_start_method("spawn", force=True)
@@ -34,6 +35,7 @@ INSTANCE = config['instance'] #0
 IN_DISK_PATH = config['paths']['in'] #"/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage2/"
 OUT_DISK_PATH = config['paths']['out'] #"/home/windowsuser/mount-folder/tempofunkds/shutterstock/stage3/"
 JSON_MAP_PATH = config['paths']['json'] #"/home/windowsuser/mount-folder/tempofunkds/shutterstock/global/raw_map.json"
+SKIP_MAP_PATH = config['paths']['skip'] #"/home/windowsuser/mount-folder/tempofunkds/shutterstock/global/skip_map.json"
 
 ## Wandb
 global USE_WANDB
@@ -99,6 +101,20 @@ def wds_reader_func(file_pipe: mp.Queue):
     logger.info("WDS: started")
     json_map = json.load(open(JSON_MAP_PATH, "r"))[str(INSTANCE)]
     
+    if SKIP_MAP_PATH is not None:
+        if SKIP_MAP_PATH is not "generate":
+            skip_map = json.load(open(SKIP_MAP_PATH, "r")) # list
+        else:
+            skip_map = os.listdir(OUT_DISK_PATH)
+            skip_map = [x for x in skip_map if x.endswith(".mp4")]
+            skip_map = [x.split(".")[0] for x in skip_map]
+        json_map = [x for x in json_map if x not in skip_map]
+
+    total_vids = len(json_map)
+    logger.info(f"WDS: Total videos: {total_vids}")
+
+    send_vids = 0
+    
     for fileid in json_map:
         try:
             logger.info(f"WDS: sending {fileid}")
@@ -112,8 +128,13 @@ def wds_reader_func(file_pipe: mp.Queue):
             logger.error(f"WDS: {fileid} ERROR - {e}")
             logger.error(traceback.format_exc())
             continue
+        finally:
+            send_vids += 1
+            logger.info(f"WDS: {send_vids}/{total_vids} videos sent")
 
-    file_pipe.put((None, None, None))
+    for i in range(ASSIGN_WORKER_COUNT):
+        file_pipe.put((None, None, None))
+
     logger.info("WDS: finished")
 
 def tpu_worker_func(
