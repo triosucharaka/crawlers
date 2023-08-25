@@ -826,6 +826,10 @@ def out_pipe_manager(main_out_pipe: mp.Queue, secondary_out_pipes: list):
 if __name__ == "__main__":
     logger.info("MAIN: started")
 
+    for x in [IN_DISK_PATH, OUT_DISK_PATH, JSON_MAP_PATH]:
+        if not os.path.exists(x):
+            raise Exception(f"Path {x} does not exist, exiting")
+
     manager = mp.Manager()
 
     ## pipes
