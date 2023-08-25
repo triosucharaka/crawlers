@@ -172,7 +172,7 @@ def tpu_worker_func(
     if SPAWN_ON_EVERYTHING:
         run = probe(f"tpu_worker_{index}")
 
-    weight_dtype = jnp.float16
+    weight_dtype = jnp.bfloat16
     vae, vae_params = FlaxAutoencoderKL.from_pretrained(
         VAE_MODEL_PATH,
         revision=VAE_MODEL_REVISION,
@@ -230,6 +230,7 @@ def tpu_worker_func(
             logger.info(f"TPU-{index}/ASYNC: placing batch")
 
             mean, std = tensor
+            mean, std = mean.astype(jnp.float32), std.astype(jnp.float32)
             mean = np.array(mean)
             std = np.array(std)
 
