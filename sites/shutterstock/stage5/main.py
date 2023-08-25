@@ -140,7 +140,7 @@ def tpu_worker_func(
     if SPAWN_ON_EVERYTHING:
         run = probe(f"tpu_worker_{index}")
 
-    weight_dtype = jnp.float16
+    weight_dtype = jnp.bfloat16
     
     text_encoder = FlaxCLIPTextModel.from_pretrained(
         CLIP_TEXT_MODEL_PATH, 
