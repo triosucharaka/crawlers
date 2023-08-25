@@ -102,13 +102,17 @@ def wds_reader_func(file_pipe: mp.Queue):
     json_map = json.load(open(JSON_MAP_PATH, "r"))[str(INSTANCE)]
     
     if SKIP_MAP_PATH != None:
+        logger.info(f"WDS: skipping videos from {SKIP_MAP_PATH}")
         if SKIP_MAP_PATH == "generate":
+            logger.info(f"WDS: generating skip map")
             skip_map = os.listdir(OUT_DISK_PATH)
             skip_map = [x for x in skip_map if x.endswith(".mp4")]
             skip_map = [x.split(".")[0] for x in skip_map]
         else:
+            logger.info(f"WDS: loading skip map")
             skip_map = json.load(open(SKIP_MAP_PATH, "r")) # list
 
+        logger.info(f"WDS: skipping {len(skip_map)} videos")
         json_map = [x for x in json_map if x not in skip_map]
 
     total_vids = len(json_map)
