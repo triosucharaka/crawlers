@@ -37,6 +37,7 @@ INSTANCE = config['instance'] #0
 IN_DISK_PATH = config['paths']['in']
 OUT_DISK_PATH = config['paths']['out']
 JSON_MAP_PATH = config['paths']['json']
+SKIP_MAP_PATH = config['paths']['skip']
 
 MEAN_EXTENSION = config['extensions']['mean']
 STD_EXTENSION = config['extensions']['std']
@@ -120,6 +121,25 @@ def wds_reader_func(file_pipe: mp.Queue):
     logger.info("WDS: started")
     json_map = json.load(open(JSON_MAP_PATH, "r"))[str(INSTANCE)]
 
+    if SKIP_MAP_PATH != None:
+        logger.info(f"WDS: skipping videos from {SKIP_MAP_PATH}")
+        if SKIP_MAP_PATH == "generate":
+            logger.info(f"WDS: generating skip map")
+            skip_map = os.listdir(OUT_DISK_PATH)
+            skip_map = [x for x in skip_map if x.endswith(f".{MEAN_EXTENSION}")]
+            skip_map = [x.split(".")[0] for x in skip_map]
+        else:
+            logger.info(f"WDS: loading skip map")
+            skip_map = json.load(open(SKIP_MAP_PATH, "r")) # list
+
+        logger.info(f"WDS: skipping {len(skip_map)} videos")
+        json_map = [x for x in json_map if x not in skip_map]
+
+    total_vids = len(json_map)
+    logger.info(f"WDS: Total videos: {total_vids}")
+
+    send_vids = 0
+
     if SPAWN_ON_EVERYTHING:
         run = probe("wds_reader")
 
@@ -136,8 +156,12 @@ def wds_reader_func(file_pipe: mp.Queue):
             logger.error(f"WDS: {fileid} ERROR - {e}")
             logger.error(traceback.format_exc())
             continue
+        finally:
+            send_vids += 1
+            logger.info(f"WDS: sent {send_vids}/{total_vids} videos")
 
-    file_pipe.put((None, None, None))
+    for i in range(ASSIGN_WORKER_COUNT):
+        file_pipe.put((None, None, None))
     logger.info("WDS: finished")
 
 def tpu_worker_func(
