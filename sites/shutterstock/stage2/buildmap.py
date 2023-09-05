@@ -1,8 +1,16 @@
 import os
 import json
-from main import DISK_PATH
+import argparse
 
-TOTAL_INSTANCES = 8
+# get instance id from args
+parser = argparse.ArgumentParser()
+parser.add_argument("--instances", type=int, required=True)
+parser.add_argument("--disk", type=str, required=True)
+args = parser.parse_args()
+INSTANCES = args.instances
+DISK_PATH = args.disk
+
+TOTAL_INSTANCES = INSTANCES
 
 filelist = os.listdir(DISK_PATH)
 idlist = list()
@@ -22,7 +30,7 @@ for i in range(TOTAL_INSTANCES):
     if i == TOTAL_INSTANCES - 1:
         end = len(idlist)
     filelist = idlist[start:end]
-    finalmap[i] = filelist
+    finalmap[i + 1] = filelist
 
 with open('map.json', 'w') as f:
     json.dump(finalmap, f)
